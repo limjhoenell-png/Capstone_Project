@@ -1,0 +1,140 @@
+﻿namespace FingerprintAttendance
+{
+    partial class MainForm
+    {
+        private System.ComponentModel.IContainer components = null;
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null)) components.Dispose();
+            base.Dispose(disposing);
+        }
+
+        private void InitializeComponent()
+        {
+            this.components = new System.ComponentModel.Container();
+            this.lblStatus = new System.Windows.Forms.Label();
+            this.lblUser = new System.Windows.Forms.Label();
+            this.picFinger = new System.Windows.Forms.PictureBox();
+            this.btnIN = new System.Windows.Forms.Button();
+            this.btnOUT = new System.Windows.Forms.Button();
+            this.btnEnroll = new System.Windows.Forms.Button();
+            this.btnLogs = new System.Windows.Forms.Button();
+            this.scanTimer = new System.Windows.Forms.Timer(this.components);
+            this.panelLeft = new System.Windows.Forms.Panel();
+            this.panelRight = new System.Windows.Forms.Panel();
+
+            ((System.ComponentModel.ISupportInitialize)(this.picFinger)).BeginInit();
+            this.panelLeft.SuspendLayout();
+            this.panelRight.SuspendLayout();
+            this.SuspendLayout();
+
+            // Form settings
+            this.Text = "Fingerprint Attendance System";
+            this.Size = new System.Drawing.Size(800, 520);
+            this.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
+            this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedSingle;
+            this.MaximizeBox = false;
+            this.BackColor = System.Drawing.Color.FromArgb(240, 240, 240);
+            this.Load += new System.EventHandler(this.MainForm_Load);
+            this.FormClosing += new System.Windows.Forms.FormClosingEventHandler(this.MainForm_FormClosing);
+
+            // panelLeft (left half — scanner area)
+            this.panelLeft.Location = new System.Drawing.Point(12, 12);
+            this.panelLeft.Size = new System.Drawing.Size(440, 460);
+            this.panelLeft.Controls.AddRange(new System.Windows.Forms.Control[] {
+                this.picFinger, this.lblStatus, this.lblUser });
+
+            // picFinger — fingerprint scan visual
+            this.picFinger.Location = new System.Drawing.Point(70, 20);
+            this.picFinger.Size = new System.Drawing.Size(300, 260);
+            this.picFinger.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
+            this.picFinger.BackColor = System.Drawing.Color.White;
+            this.picFinger.SizeMode = System.Windows.Forms.PictureBoxSizeMode.CenterImage;
+
+            // lblStatus
+            this.lblStatus.Location = new System.Drawing.Point(10, 295);
+            this.lblStatus.Size = new System.Drawing.Size(420, 40);
+            this.lblStatus.Text = "Initializing device...";
+            this.lblStatus.Font = new System.Drawing.Font("Segoe UI", 11F);
+            this.lblStatus.ForeColor = System.Drawing.Color.RoyalBlue;
+            this.lblStatus.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
+
+            // lblUser
+            this.lblUser.Location = new System.Drawing.Point(10, 345);
+            this.lblUser.Size = new System.Drawing.Size(420, 50);
+            this.lblUser.Text = "";
+            this.lblUser.Font = new System.Drawing.Font("Segoe UI", 16F, System.Drawing.FontStyle.Bold);
+            this.lblUser.ForeColor = System.Drawing.Color.DarkGreen;
+            this.lblUser.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
+
+            // panelRight (right side — buttons)
+            this.panelRight.Location = new System.Drawing.Point(465, 12);
+            this.panelRight.Size = new System.Drawing.Size(300, 460);
+            this.panelRight.Controls.AddRange(new System.Windows.Forms.Control[] {
+                this.btnIN, this.btnOUT, this.btnEnroll, this.btnLogs });
+
+            // btnIN
+            this.btnIN.Location = new System.Drawing.Point(20, 20);
+            this.btnIN.Size = new System.Drawing.Size(260, 60);
+            this.btnIN.Text = "LOG  IN";
+            this.btnIN.Font = new System.Drawing.Font("Segoe UI", 14F, System.Drawing.FontStyle.Bold);
+            this.btnIN.BackColor = System.Drawing.Color.FromArgb(76, 175, 80);
+            this.btnIN.ForeColor = System.Drawing.Color.White;
+            this.btnIN.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnIN.Click += new System.EventHandler(this.btnIN_Click);
+
+            // btnOUT
+            this.btnOUT.Location = new System.Drawing.Point(20, 95);
+            this.btnOUT.Size = new System.Drawing.Size(260, 60);
+            this.btnOUT.Text = "LOG  OUT";
+            this.btnOUT.Font = new System.Drawing.Font("Segoe UI", 14F, System.Drawing.FontStyle.Bold);
+            this.btnOUT.BackColor = System.Drawing.Color.FromArgb(229, 57, 53);
+            this.btnOUT.ForeColor = System.Drawing.Color.White;
+            this.btnOUT.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnOUT.Click += new System.EventHandler(this.btnOUT_Click);
+
+            // btnEnroll
+            this.btnEnroll.Location = new System.Drawing.Point(20, 220);
+            this.btnEnroll.Size = new System.Drawing.Size(260, 50);
+            this.btnEnroll.Text = "Enroll New User";
+            this.btnEnroll.Font = new System.Drawing.Font("Segoe UI", 11F);
+            this.btnEnroll.BackColor = System.Drawing.Color.FromArgb(25, 118, 210);
+            this.btnEnroll.ForeColor = System.Drawing.Color.White;
+            this.btnEnroll.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnEnroll.Click += new System.EventHandler(this.btnEnroll_Click);
+
+            // btnLogs
+            this.btnLogs.Location = new System.Drawing.Point(20, 285);
+            this.btnLogs.Size = new System.Drawing.Size(260, 50);
+            this.btnLogs.Text = "View Attendance Log";
+            this.btnLogs.Font = new System.Drawing.Font("Segoe UI", 11F);
+            this.btnLogs.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnLogs.Click += new System.EventHandler(this.btnLogs_Click);
+
+            // scanTimer
+            this.scanTimer.Interval = 500;
+            this.scanTimer.Tick += new System.EventHandler(this.scanTimer_Tick);
+
+            // Add panels to form
+            this.Controls.AddRange(new System.Windows.Forms.Control[] {
+                this.panelLeft, this.panelRight });
+
+            ((System.ComponentModel.ISupportInitialize)(this.picFinger)).EndInit();
+            this.panelLeft.ResumeLayout(false);
+            this.panelRight.ResumeLayout(false);
+            this.ResumeLayout(false);
+        }
+
+        private System.Windows.Forms.Label lblStatus;
+        private System.Windows.Forms.Label lblUser;
+        private System.Windows.Forms.PictureBox picFinger;
+        private System.Windows.Forms.Button btnIN;
+        private System.Windows.Forms.Button btnOUT;
+        private System.Windows.Forms.Button btnEnroll;
+        private System.Windows.Forms.Button btnLogs;
+        private System.Windows.Forms.Timer scanTimer;
+        private System.Windows.Forms.Panel panelLeft;
+        private System.Windows.Forms.Panel panelRight;
+    }
+}

@@ -1,0 +1,128 @@
+﻿namespace FingerprintAttendance
+{
+    partial class EnrollForm
+    {
+        private System.ComponentModel.IContainer components = null;
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null)) components.Dispose();
+            base.Dispose(disposing);
+        }
+
+        private void InitializeComponent()
+        {
+            this.lblTitle = new System.Windows.Forms.Label();
+            this.lblName = new System.Windows.Forms.Label();
+            this.txtFullName = new System.Windows.Forms.TextBox();
+            this.lblEmpId = new System.Windows.Forms.Label();
+            this.txtEmpId = new System.Windows.Forms.TextBox();
+            this.lblScanStatus = new System.Windows.Forms.Label();
+            this.progressBar = new System.Windows.Forms.ProgressBar();
+            this.lblProgress = new System.Windows.Forms.Label();
+            this.btnStartEnroll = new System.Windows.Forms.Button();
+            this.btnCancel = new System.Windows.Forms.Button();
+            this.SuspendLayout();
+
+            // Form
+            this.Text = "Enroll New User";
+            this.Size = new System.Drawing.Size(420, 380);
+            this.StartPosition = System.Windows.Forms.FormStartPosition.CenterParent;
+            this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog;
+            this.MaximizeBox = false;
+            this.MinimizeBox = false;
+            this.BackColor = System.Drawing.Color.FromArgb(245, 245, 245);
+
+            // lblTitle
+            this.lblTitle.Location = new System.Drawing.Point(12, 12);
+            this.lblTitle.Size = new System.Drawing.Size(380, 30);
+            this.lblTitle.Text = "Register a new fingerprint user";
+            this.lblTitle.Font = new System.Drawing.Font("Segoe UI", 13F, System.Drawing.FontStyle.Bold);
+            this.lblTitle.ForeColor = System.Drawing.Color.FromArgb(25, 118, 210);
+
+            // lblName
+            this.lblName.Location = new System.Drawing.Point(12, 55);
+            this.lblName.Size = new System.Drawing.Size(100, 20);
+            this.lblName.Text = "Full Name:";
+            this.lblName.Font = new System.Drawing.Font("Segoe UI", 10F);
+
+            // txtFullName
+            this.txtFullName.Location = new System.Drawing.Point(12, 75);
+            this.txtFullName.Size = new System.Drawing.Size(376, 26);
+            this.txtFullName.Font = new System.Drawing.Font("Segoe UI", 11F);
+
+            // lblEmpId
+            this.lblEmpId.Location = new System.Drawing.Point(12, 112);
+            this.lblEmpId.Size = new System.Drawing.Size(120, 20);
+            this.lblEmpId.Text = "Employee ID:";
+            this.lblEmpId.Font = new System.Drawing.Font("Segoe UI", 10F);
+
+            // txtEmpId
+            this.txtEmpId.Location = new System.Drawing.Point(12, 132);
+            this.txtEmpId.Size = new System.Drawing.Size(376, 26);
+            this.txtEmpId.Font = new System.Drawing.Font("Segoe UI", 11F);
+
+            // lblScanStatus
+            this.lblScanStatus.Location = new System.Drawing.Point(12, 178);
+            this.lblScanStatus.Size = new System.Drawing.Size(376, 40);
+            this.lblScanStatus.Text = "Press 'Start Enrollment' to begin";
+            this.lblScanStatus.Font = new System.Drawing.Font("Segoe UI", 11F);
+            this.lblScanStatus.ForeColor = System.Drawing.Color.RoyalBlue;
+            this.lblScanStatus.TextAlign = System.Drawing.ContentAlignment.MiddleCenter;
+            this.lblScanStatus.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
+            this.lblScanStatus.BackColor = System.Drawing.Color.White;
+
+            // lblProgress
+            this.lblProgress.Location = new System.Drawing.Point(12, 228);
+            this.lblProgress.Size = new System.Drawing.Size(200, 20);
+            this.lblProgress.Text = "Scan progress (0 of 3):";
+            this.lblProgress.Font = new System.Drawing.Font("Segoe UI", 9F);
+
+            // progressBar
+            this.progressBar.Location = new System.Drawing.Point(12, 248);
+            this.progressBar.Size = new System.Drawing.Size(376, 22);
+            this.progressBar.Maximum = 3;
+            this.progressBar.Value = 0;
+            this.progressBar.Style = System.Windows.Forms.ProgressBarStyle.Continuous;
+
+            // btnStartEnroll
+            this.btnStartEnroll.Location = new System.Drawing.Point(12, 294);
+            this.btnStartEnroll.Size = new System.Drawing.Size(180, 40);
+            this.btnStartEnroll.Text = "Start Enrollment";
+            this.btnStartEnroll.Font = new System.Drawing.Font("Segoe UI", 11F);
+            this.btnStartEnroll.BackColor = System.Drawing.Color.FromArgb(76, 175, 80);
+            this.btnStartEnroll.ForeColor = System.Drawing.Color.White;
+            this.btnStartEnroll.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnStartEnroll.Click += new System.EventHandler(this.btnStartEnroll_Click);
+
+            // btnCancel
+            this.btnCancel.Location = new System.Drawing.Point(208, 294);
+            this.btnCancel.Size = new System.Drawing.Size(180, 40);
+            this.btnCancel.Text = "Cancel";
+            this.btnCancel.Font = new System.Drawing.Font("Segoe UI", 11F);
+            this.btnCancel.BackColor = System.Drawing.Color.FromArgb(229, 57, 53);
+            this.btnCancel.ForeColor = System.Drawing.Color.White;
+            this.btnCancel.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnCancel.Click += new System.EventHandler(this.btnCancel_Click);
+
+            this.Controls.AddRange(new System.Windows.Forms.Control[] {
+                this.lblTitle, this.lblName, this.txtFullName,
+                this.lblEmpId, this.txtEmpId, this.lblScanStatus,
+                this.lblProgress, this.progressBar,
+                this.btnStartEnroll, this.btnCancel });
+
+            this.ResumeLayout(false);
+        }
+
+        private System.Windows.Forms.Label lblTitle;
+        private System.Windows.Forms.Label lblName;
+        private System.Windows.Forms.TextBox txtFullName;
+        private System.Windows.Forms.Label lblEmpId;
+        private System.Windows.Forms.TextBox txtEmpId;
+        private System.Windows.Forms.Label lblScanStatus;
+        private System.Windows.Forms.Label lblProgress;
+        private System.Windows.Forms.ProgressBar progressBar;
+        private System.Windows.Forms.Button btnStartEnroll;
+        private System.Windows.Forms.Button btnCancel;
+    }
+}

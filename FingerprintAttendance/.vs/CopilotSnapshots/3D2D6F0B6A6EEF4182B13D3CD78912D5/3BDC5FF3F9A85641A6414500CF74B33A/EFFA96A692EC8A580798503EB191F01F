@@ -1,0 +1,46 @@
+﻿using System;
+using System.Windows.Forms;
+using FingerprintAttendance.Core;
+
+namespace FingerprintAttendance.Forms
+{
+    public partial class AttendanceLogForm : Form
+    {
+        private DatabaseHelper _db;
+
+        public AttendanceLogForm(DatabaseHelper db)
+        {
+            InitializeComponent();
+            _db = db;
+        }
+
+        private void AttendanceLogForm_Load(object sender, EventArgs e)
+        {
+            datePicker.Value = DateTime.Today;
+            LoadLogs();
+
+            // Make grid look clean
+            dgvLogs.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            dgvLogs.ReadOnly = true;
+            dgvLogs.AllowUserToAddRows = false;
+        }
+
+        private void btnLoad_Click(object sender, EventArgs e) => LoadLogs();
+
+        private void LoadLogs()
+        {
+            var logs = _db.GetAttendanceLogs(datePicker.Value);
+            dgvLogs.DataSource = logs;
+
+            // Rename columns nicely
+            if (dgvLogs.Columns.Count > 0)
+            {
+                dgvLogs.Columns["Id"].HeaderText = "#";
+                dgvLogs.Columns["UserId"].Visible = false;
+                dgvLogs.Columns["FullName"].HeaderText = "Name";
+                dgvLogs.Columns["LogTime"].HeaderText = "Time";
+                dgvLogs.Columns["EntryType"].HeaderText = "IN / OUT";
+            }
+        }
+    }
+}

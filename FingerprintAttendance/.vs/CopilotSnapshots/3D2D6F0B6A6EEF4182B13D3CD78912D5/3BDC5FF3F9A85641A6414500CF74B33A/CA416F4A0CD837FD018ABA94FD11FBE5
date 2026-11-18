@@ -1,0 +1,77 @@
+﻿namespace FingerprintAttendance
+{
+    partial class AttendanceLogForm
+    {
+        private System.ComponentModel.IContainer components = null;
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && (components != null)) components.Dispose();
+            base.Dispose(disposing);
+        }
+
+        private void InitializeComponent()
+        {
+            this.lblDate = new System.Windows.Forms.Label();
+            this.datePicker = new System.Windows.Forms.DateTimePicker();
+            this.btnLoad = new System.Windows.Forms.Button();
+            this.dgvLogs = new System.Windows.Forms.DataGridView();
+            ((System.ComponentModel.ISupportInitialize)(this.dgvLogs)).BeginInit();
+            this.SuspendLayout();
+
+            // Form
+            this.Text = "Attendance Log";
+            this.Size = new System.Drawing.Size(700, 520);
+            this.StartPosition = System.Windows.Forms.FormStartPosition.CenterParent;
+            this.BackColor = System.Drawing.Color.FromArgb(245, 245, 245);
+            this.Load += new System.EventHandler(this.AttendanceLogForm_Load);
+
+            // lblDate
+            this.lblDate.Location = new System.Drawing.Point(12, 16);
+            this.lblDate.Size = new System.Drawing.Size(40, 26);
+            this.lblDate.Text = "Date:";
+            this.lblDate.Font = new System.Drawing.Font("Segoe UI", 10F);
+            this.lblDate.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+
+            // datePicker
+            this.datePicker.Location = new System.Drawing.Point(55, 13);
+            this.datePicker.Size = new System.Drawing.Size(180, 26);
+            this.datePicker.Font = new System.Drawing.Font("Segoe UI", 10F);
+            this.datePicker.Format = System.Windows.Forms.DateTimePickerFormat.Short;
+
+            // btnLoad
+            this.btnLoad.Location = new System.Drawing.Point(248, 12);
+            this.btnLoad.Size = new System.Drawing.Size(120, 30);
+            this.btnLoad.Text = "Load Records";
+            this.btnLoad.Font = new System.Drawing.Font("Segoe UI", 10F);
+            this.btnLoad.BackColor = System.Drawing.Color.FromArgb(25, 118, 210);
+            this.btnLoad.ForeColor = System.Drawing.Color.White;
+            this.btnLoad.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+            this.btnLoad.Click += new System.EventHandler(this.btnLoad_Click);
+
+            // dgvLogs
+            this.dgvLogs.Location = new System.Drawing.Point(12, 54);
+            this.dgvLogs.Size = new System.Drawing.Size(658, 416);
+            this.dgvLogs.BackgroundColor = System.Drawing.Color.White;
+            this.dgvLogs.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
+            this.dgvLogs.ColumnHeadersHeight = 32;
+            this.dgvLogs.RowTemplate.Height = 28;
+            this.dgvLogs.Font = new System.Drawing.Font("Segoe UI", 10F);
+            this.dgvLogs.AllowUserToAddRows = false;
+            this.dgvLogs.ReadOnly = true;
+            this.dgvLogs.SelectionMode = System.Windows.Forms.DataGridViewSelectionMode.FullRowSelect;
+            this.dgvLogs.AutoSizeColumnsMode = System.Windows.Forms.DataGridViewAutoSizeColumnsMode.Fill;
+
+            this.Controls.AddRange(new System.Windows.Forms.Control[] {
+                this.lblDate, this.datePicker, this.btnLoad, this.dgvLogs });
+
+            ((System.ComponentModel.ISupportInitialize)(this.dgvLogs)).EndInit();
+            this.ResumeLayout(false);
+        }
+
+        private System.Windows.Forms.Label lblDate;
+        private System.Windows.Forms.DateTimePicker datePicker;
+        private System.Windows.Forms.Button btnLoad;
+        private System.Windows.Forms.DataGridView dgvLogs;
+    }
+}

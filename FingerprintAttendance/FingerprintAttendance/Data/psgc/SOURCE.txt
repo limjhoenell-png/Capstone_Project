@@ -1,0 +1,34 @@
+Philippine Standard Geographic Code (PSGC) — local offline data
+================================================================
+
+Runtime files (copied next to the application):
+  regions.tsv
+  provinces.tsv
+  muncities.tsv
+  barangays.tsv.gz
+
+These files contain the complete Philippine administrative hierarchy:
+  18 regions
+  115 provinces / highly urbanized cities / NCR cities
+  1,656 cities and municipalities
+  42,011 barangays
+
+Source:
+  Official PSA PSGC 2nd Quarter 2025 release, packaged as JSON by
+  https://github.com/jobuntux/psgc  (data/2025-2Q/).
+
+To refresh the data:
+  1. Download regions.json, provinces.json, muncities.json, and barangays.json
+     from that folder into this directory.
+  2. Run:  python tools/build_psgc_tsv.py
+  3. Rebuild the application so Data\psgc is copied to the output folder.
+
+The employee record continues to store the selected address in users.address.
+No extra geography tables are required, and existing employee rows are left unchanged.
+
+NCR note:
+  Highly urbanized cities appear as provinces (for example City of Makati).
+  City of Manila is the exception: its barangays are grouped under 14 districts
+  (Binondo, Ermita, Intramuros, Malate, Paco, Pandacan, Port Area, Quiapo,
+  Sampaloc, San Miguel, San Nicolas, Santa Ana, Santa Cruz, Tondo I/II).
+  Select the district in City/Municipality, then the barangay.

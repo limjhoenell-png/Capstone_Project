@@ -1,0 +1,373 @@
+﻿using MySql.Data.MySqlClient;
+using System;
+using System.Data;
+using System.Windows.Forms;
+using libzkfpcsharp;
+
+namespace FingerprintAttendance.Core
+{
+    public class FingerprintEngine : IDisposable
+    {
+        private IntPtr mDevHandle = IntPtr.Zero;
+        private IntPtr mDBHandle = IntPtr.Zero;
+
+        public bool IsConnected { get; private set; }
+        public string LastError { get; private set; } = string.Empty;
+        public const int MATCH_THRESHOLD = 50;
+
+        public event Action<int, DateTime> OnFingerprintVerified;
+
+        public FingerprintEngine()
+        {
+            try
+            {
+                int ret = zkfp2.Init();
+                if (ret != zkfperrdef.ZKFP_ERR_OK)
+                    throw new Exception($"ZKFinger SDK init failed. Code: {ret}");
+
+                mDBHandle = zkfp2.DBInit();
+                if (mDBHandle == IntPtr.Zero)
+                    throw new Exception("ZKFinger in-memory database init failed.");
+
+                IsConnected = false;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("ZKFinger SDK startup error: " + ex.Message, "Error");
+            }
+        }
+
+        // ── Connection ────────────────────────────────────────────────
+
+        public bool Connect()
+        {
+            try
+            {
+                if (zkfp2.GetDeviceCount() <= 0)
+                {
+                    LastError = "No fingerprint device found. Check the USB cable.";
+                    return false;
+                }
+
+                mDevHandle = zkfp2.OpenDevice(0);
+                if (mDevHandle == IntPtr.Zero)
+                {
+                    LastError = "Device found but could not be opened.";
+                    return false;
+                }
+
+                IsConnected = true;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                return false;
+            }
+        }
+
+        public void Disconnect()
+        {
+            if (mDevHandle != IntPtr.Zero)
+            {
+                try { zkfp2.CloseDevice(mDevHandle); }
+                catch { }
+                finally { mDevHandle = IntPtr.Zero; }
+            }
+            try { zkfp2.Terminate(); }
+            catch { }
+            finally { IsConnected = false; }
+        }
+
+        public IntPtr GetDatabaseHandle() => mDBHandle;
+
+        // ── Persistence ───────────────────────────────────────────────
+
+        /// <summary>
+        /// Loads every saved fingerprint template from MySQL into the
+        /// ZKFinger in-memory database.  Must be called once after Connect()
+        /// or no identifications will ever succeed after an app restart.
+        /// </summary>
+        public void LoadAllFingerprintsFromDatabase()
+        {
+            if (mDBHandle == IntPtr.Zero) return;
+            try
+            {
+                using var conn = new MySqlConnection("Server=localhost;Port=3306;Database=attendance_db;Uid=root;Pwd=;");
+                conn.Open();
+                string sql = "SELECT id, fp_template FROM users WHERE fp_template IS NOT NULL";
+                using var cmd = new MySqlCommand(sql, conn);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    int uid = reader.GetInt32("id");
+                    byte[] tpl = reader["fp_template"] as byte[];
+                    if (tpl != null && tpl.Length > 0)
+                        zkfp2.DBAdd(mDBHandle, uid, tpl);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Could not load fingerprint templates:\n" + ex.Message, "Error");
+            }
+        }
+
+        // ── Enrollment ────────────────────────────────────────────────
+
+        /// <summary>
+        /// Captures three scans, merges them, stores the result in the
+        /// in-memory ZKFinger database, and saves the template to MySQL.
+        ///
+        /// MUST be called from a background thread (Task.Run) because
+        /// AcquireFingerprint blocks the calling thread while waiting for a
+        /// physical finger press — typically 5-15 seconds per attempt.
+        /// Running it on the UI thread freezes the window and causes Windows
+        /// to show "Not Responding", hiding the scan prompts from the user.
+        ///
+        /// Use the onPromptScan callback (marshalled via Control.Invoke) to
+        /// update status labels between scans without touching the device.
+        /// </summary>
+        /// <param name="userId">DB primary key of the user being enrolled.</param>
+        /// <param name="onPromptScan">
+        ///   Called before each capture with the attempt number (1, 2, 3).
+        ///   Always marshal back to the UI thread inside this callback:
+        ///     this.Invoke((Action)(() => lblStatus.Text = "..."));
+        /// </param>
+        /// <returns>
+        ///   true  – all three scans captured, merged, registered in DB and saved to MySQL.
+        ///   false – at least one step failed; read LastError for the specific reason.
+        /// </returns>
+        public bool StartEnrollment(int userId, Action<int> onPromptScan = null)
+        {
+            if (!IsConnected || mDBHandle == IntPtr.Zero)
+            {
+                LastError = "Device is not connected.";
+                return false;
+            }
+
+            try
+            {
+                byte[][] captured = new byte[3][];
+
+                // ── 1. Capture three scans ────────────────────────────
+                for (int i = 0; i < 3; i++)
+                {
+                    // Update the UI label BEFORE blocking on the capture call
+                    onPromptScan?.Invoke(i + 1);
+
+                    byte[] fpImage = new byte[2048];
+                    byte[] capTmp = new byte[2048];
+                    int cbCapTmp = 2048;
+
+                    int ret = zkfp2.AcquireFingerprint(mDevHandle, fpImage, capTmp, ref cbCapTmp);
+
+                    if (ret != zkfperrdef.ZKFP_ERR_OK)
+                    {
+                        LastError = $"STEP 1 FAILED — Scan {i + 1} of 3 could not be captured.\n" +
+                                    $"SDK error code: {ret}\n" +
+                                    "Make sure your finger is flat and centred on the sensor.";
+                        return false;
+                    }
+
+                    // Trim to actual size — passing a zero-padded 2048-byte array to
+                    // DBMerge can cause merge failures on some SDK versions.
+                    captured[i] = new byte[cbCapTmp];
+                    Array.Copy(capTmp, captured[i], cbCapTmp);
+
+                    // Give the user time to fully lift their finger before the next prompt.
+                    // Too short and the sensor still sees residual contact on the next scan.
+                    if (i < 2)
+                        System.Threading.Thread.Sleep(800);
+                }
+
+                // ── 2. Merge the three captures ───────────────────────
+                byte[] regTmp = new byte[2048];
+                int cbRegTmp = 2048;
+
+                int mergeRet = zkfp2.DBMerge(
+                    mDBHandle,
+                    captured[0], captured[1], captured[2],
+                    regTmp, ref cbRegTmp);
+
+                if (mergeRet != zkfperrdef.ZKFP_ERR_OK)
+                {
+                    LastError = $"STEP 2 FAILED — Could not merge the three scans.\n" +
+                                $"SDK error code: {mergeRet}\n" +
+                                "Use the same finger each time with consistent flat placement.";
+                    return false;
+                }
+
+                // Trim the merged template to its actual size
+                byte[] finalTemplate = new byte[cbRegTmp];
+                Array.Copy(regTmp, finalTemplate, cbRegTmp);
+
+                // ── 3. Register in the in-memory ZKFinger database ────
+                int addRet = zkfp2.DBAdd(mDBHandle, userId, finalTemplate);
+                if (addRet != zkfperrdef.ZKFP_ERR_OK)
+                {
+                    LastError = $"STEP 3 FAILED — Could not register template in ZKFinger DB.\n" +
+                                $"SDK error code: {addRet}";
+                    return false;
+                }
+
+                // ── 4. Persist to MySQL ───────────────────────────────
+                // This is deliberately the LAST step. If it throws, the exception
+                // propagates to the catch block below which sets LastError with the
+                // exact MySQL error message so the caller can display it.
+                DatabaseHelper.ExecuteNonQuery(
+                    "UPDATE users SET fingerprint_template = @tpl WHERE user_id = @uid",
+                    new MySqlParameter("@tpl", finalTemplate),
+                    new MySqlParameter("@uid", userId));
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LastError = "STEP 4 FAILED — Could not save template to MySQL.\n" + ex.Message;
+                return false;
+            }
+        }
+
+        public void CancelEnrollment() { /* extend if SDK exposes a cancel API */ }
+
+        // ── Identification ────────────────────────────────────────────
+
+        /// <summary>
+        /// Captures a fingerprint and searches the in-memory database (1:N).
+        /// Returns the matched user ID, or -1 on no match / error.
+        /// </summary>
+        public int IdentifyUser()
+        {
+            if (!IsConnected || mDBHandle == IntPtr.Zero)
+            {
+                LastError = "Device is not connected.";
+                return -1;
+            }
+
+            try
+            {
+                byte[] fpImage = new byte[2048];
+                byte[] capTmp = new byte[2048];
+                int cbCapTmp = 2048;
+
+                int ret = zkfp2.AcquireFingerprint(mDevHandle, fpImage, capTmp, ref cbCapTmp);
+                if (ret != zkfperrdef.ZKFP_ERR_OK)
+                {
+                    LastError = $"Capture failed. SDK code: {ret}";
+                    return -1;
+                }
+
+                int fid = 0, score = 0;
+                int identRet = zkfp2.DBIdentify(mDBHandle, capTmp, ref fid, ref score);
+
+                if (identRet == zkfperrdef.ZKFP_ERR_OK)
+                    return fid;
+
+                LastError = "Fingerprint not recognised in database.";
+                return -1;
+            }
+            catch (Exception ex)
+            {
+                LastError = ex.Message;
+                return -1;
+            }
+        }
+
+        /// <summary>Performs 1:1 verification for a known user.</summary>
+        public bool VerifyUser(int userId)
+        {
+            if (!IsConnected) return false;
+            try
+            {
+                byte[] fpImage = new byte[2048];
+                byte[] capTmp = new byte[2048];
+                int cbCapTmp = 2048;
+                int ret = zkfp2.AcquireFingerprint(mDevHandle, fpImage, capTmp, ref cbCapTmp);
+                return ret == zkfperrdef.ZKFP_ERR_OK;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Captures a single fingerprint scan from the device.</summary>
+        public byte[] CaptureScan()
+        {
+            if (!IsConnected || mDevHandle == IntPtr.Zero)
+                return null;
+
+            try
+            {
+                byte[] fpImage = new byte[2048];
+                byte[] capTmp = new byte[2048];
+                int cbCapTmp = 2048;
+
+                int ret = zkfp2.AcquireFingerprint(mDevHandle, fpImage, capTmp, ref cbCapTmp);
+                if (ret != zkfperrdef.ZKFP_ERR_OK)
+                    return null;
+
+                byte[] result = new byte[cbCapTmp];
+                Array.Copy(capTmp, result, cbCapTmp);
+                return result;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>Merges three fingerprint scans into a single template.</summary>
+        public byte[] MergeTemplates(byte[] scan1, byte[] scan2, byte[] scan3)
+        {
+            if (mDBHandle == IntPtr.Zero || scan1 == null || scan2 == null || scan3 == null)
+                return null;
+
+            try
+            {
+                byte[] regTmp = new byte[2048];
+                int cbRegTmp = 2048;
+
+                int mergeRet = zkfp2.DBMerge(mDBHandle, scan1, scan2, scan3, regTmp, ref cbRegTmp);
+                if (mergeRet != zkfperrdef.ZKFP_ERR_OK)
+                    return null;
+
+                byte[] result = new byte[cbRegTmp];
+                Array.Copy(regTmp, result, cbRegTmp);
+                return result;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>Matches a scanned fingerprint against a template. Returns a match score.</summary>
+        public int MatchTemplates(byte[] liveScan, byte[] templateScan)
+        {
+            if (liveScan == null || templateScan == null)
+                return 0;
+
+            try
+            {
+                int score = 0;
+                int matchRet = zkfp2.DBMatch(mDBHandle, liveScan, templateScan, ref score);
+                return matchRet == zkfperrdef.ZKFP_ERR_OK ? score : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>Initializes the fingerprint engine (alias for Connect).</summary>
+        public void Initialize()
+        {
+            Connect();
+        }
+
+        /// <summary>Disposes resources.</summary>
+        public void Dispose()
+        {
+            Disconnect();
+            GC.SuppressFinalize(this);
+        }
+    }
+}

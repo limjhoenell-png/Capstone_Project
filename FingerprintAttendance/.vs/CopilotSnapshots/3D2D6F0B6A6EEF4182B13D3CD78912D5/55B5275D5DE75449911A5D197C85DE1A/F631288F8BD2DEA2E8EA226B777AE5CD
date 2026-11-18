@@ -1,0 +1,1042 @@
+﻿using FingerprintAttendance.Core;
+using FingerprintAttendance.Models;
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace FingerprintAttendance
+{
+    public partial class MainForm : Form
+    {
+        private FingerprintEngine _engine = new FingerprintEngine();
+        private DatabaseHelper _db = new DatabaseHelper();
+        private List<UserModel> _users;
+        private int? _lastEmployeeStatusUserId = null;
+        private string _lastEmployeeStatusActionText = null;
+        private DateTime _lastEmployeeStatusSetAt = DateTime.MinValue;
+        private string _lastEmployeeStatusRenderedName = null;
+        private bool _isScanning = false;
+        private bool _isEnrollOpen = false;
+        private bool _isReturningVisitorFlowOpen = false;
+        private string _lastScreenDeviceName = null;
+        private bool _isApplyingPerScreenMaximize = false;
+        private bool _chromeBusy;
+
+        public MainForm()
+        {
+            InitializeComponent();
+
+            // Start maximized on the monitor that opens the app. After that the window can be
+            // restored and dragged; it is not forced back to maximized on every move.
+            StartPosition = FormStartPosition.Manual;
+            WindowState = FormWindowState.Maximized;
+            Shown += (_, __) =>
+            {
+                ApplyMaximizeToCurrentScreen(force: true);
+                ApplyResponsiveChrome();
+            };
+            Resize += (_, __) => ApplyResponsiveChrome();
+        }
+
+        private void ApplyResponsiveChrome()
+        {
+            if (_chromeBusy || WindowState == FormWindowState.Minimized)
+                return;
+
+            _chromeBusy = true;
+            try
+            {
+                ApplyResponsiveChromeCore();
+            }
+            finally
+            {
+                _chromeBusy = false;
+            }
+        }
+
+        private void ApplyResponsiveChromeCore()
+        {
+            if (WindowState == FormWindowState.Minimized)
+                return;
+
+            var work = Screen.FromControl(this).WorkingArea;
+            int minW = Math.Min(800, Math.Max(640, work.Width - 16));
+            int minH = Math.Min(520, Math.Max(420, work.Height - 16));
+            var nextMinimum = new Size(minW, minH);
+            if (MinimumSize != nextMinimum)
+                MinimumSize = nextMinimum;
+
+            int width = ClientSize.Width;
+            int sidebar = width < 1100 ? 260 : width < 1440 ? 320 : 370;
+            if (panelRight.Width != sidebar)
+                panelRight.Width = sidebar;
+
+            float titleSize = width < 1100 ? 13F : 16F;
+            if (Math.Abs(lblAppTitle.Font.SizeInPoints - titleSize) > 0.4F)
+                lblAppTitle.Font = new Font(lblAppTitle.Font.FontFamily, titleSize, FontStyle.Bold);
+
+            float clockSize = width < 1100 ? 12F : 15F;
+            if (Math.Abs(lblCurrentTime.Font.SizeInPoints - clockSize) > 0.4F)
+                lblCurrentTime.Font = new Font(lblCurrentTime.Font.FontFamily, clockSize, FontStyle.Bold);
+
+            int statusHeight = ClientSize.Height < 680 ? 108 : 140;
+            if (pnlStatusArea.Height != statusHeight)
+                pnlStatusArea.Height = statusHeight;
+        }
+
+        private void ApplyMaximizeToCurrentScreen(bool force)
+        {
+            if (_isApplyingPerScreenMaximize)
+                return;
+
+            // Don't fight the user if the window is minimized.
+            if (WindowState == FormWindowState.Minimized)
+                return;
+
+            var screen = Screen.FromControl(this);
+            if (screen == null)
+                return;
+
+            // Only re-apply when we detect a monitor change, unless forced (startup).
+            if (!force && string.Equals(_lastScreenDeviceName, screen.DeviceName, StringComparison.Ordinal))
+                return;
+
+            _lastScreenDeviceName = screen.DeviceName;
+            _isApplyingPerScreenMaximize = true;
+            try
+            {
+                // Reset bounds to the new monitor's working area then maximize.
+                WindowState = FormWindowState.Normal;
+                Bounds = screen.WorkingArea;
+                WindowState = FormWindowState.Maximized;
+            }
+            finally
+            {
+                _isApplyingPerScreenMaximize = false;
+            }
+        }
+
+        private void MainForm_Load(object sender, EventArgs e)
+        {
+            UpdateClockDisplay();
+            clockTimer.Start();
+
+            // Test DB connection
+            if (!_db.TestConnection())
+            {
+                var detail = string.IsNullOrWhiteSpace(_db.LastConnectionFailureDetail)
+                    ? ""
+                    : "\n\nDetails:\n" + _db.LastConnectionFailureDetail;
+                MessageBox.Show(
+                    "Cannot connect to MySQL attendance_db database.\n\n" +
+                    "Ensure MySQL Server is running and verify:\n" +
+                    "• Host: 127.0.0.1\n" +
+                    "• Port: 3306\n" +
+                    "• User: root\n" +
+                    "• Password: configured in AppDbConnection (DatabaseHelper.cs)\n" +
+                    "• Database: attendance_db exists\n\n" +
+                    "Check AppDbConnection class at the bottom of DatabaseHelper.cs " +
+                    "to verify connection settings match your MySQL Workbench configuration." +
+                    detail,
+                    "Database Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Application.Exit();
+                return;
+            }
+
+            // Initialize fingerprint device
+            try
+            {
+                _engine.Initialize();
+                _db.EnsureLogbookTable();
+                _engine.LoadAllFingerprintsFromDatabase();
+                lblStatus.Text = "Biometric device is ready to use.";
+                lblStatus.ForeColor = Color.Green;
+                _users = _db.GetAllUsersWithTemplates();
+                scanTimer.Start();
+            }
+            catch (Exception ex)
+            {
+                lblStatus.Text = "Device not found: " + ex.Message;
+                lblStatus.ForeColor = Color.Red;
+            }
+        }
+
+        // Called every 500ms — polls for a fingerprint on a background thread
+        private void scanTimer_Tick(object sender, EventArgs e)
+        {
+            if (_isScanning || _isEnrollOpen) return;
+
+            Task.Run(() => PerformScan());
+        }
+
+        private void PerformScan()
+        {
+            _isScanning = true;
+            try
+            {
+                int matchedUserId = _engine.IdentifyUser();
+                this.Invoke((Action)(() => RenderLiveFingerprintImage()));
+                if (matchedUserId < 0)
+                {
+                    // Don't spam the UI when no finger is placed.
+                    if (!string.IsNullOrEmpty(_engine.LastError) &&
+                        _engine.LastError.StartsWith("Capture timed out", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return;
+                    }
+
+                    this.Invoke((Action)(() =>
+                    {
+                        lblUser.Text = string.Empty;
+                        if (string.Equals(_engine.LastError, "Device is not connected.", StringComparison.OrdinalIgnoreCase))
+                            lblStatus.Text = "Scan error: Biometric device not connected.";
+                        else
+                            lblStatus.Text = "Scan error: " + _engine.LastError;
+                        lblStatus.ForeColor = Color.OrangeRed;
+                    }));
+                    return;
+                }
+
+                if (matchedUserId >= DatabaseHelper.VisitorFingerprintIdRangeStart)
+                {
+                    this.Invoke((Action)(() => HandleReturningVisitorFingerprint(matchedUserId)));
+                    return;
+                }
+
+                // Staff IDs: always verify the current MySQL row (not an in-memory cache) so
+                // a deleted or de-enrolled user cannot clock in if ZK still has an old match.
+                UserModel liveEmployee = _db.TryGetUserWithValidTemplateById(matchedUserId);
+                if (liveEmployee != null)
+                {
+                    this.Invoke((Action)(() => HandleEmployeeFingerprint(liveEmployee)));
+                    return;
+                }
+
+                // ZK matched a staff id that no longer exists in the database (or template removed).
+                _isEnrollOpen = true;
+                this.BeginInvoke((Action)(() => { _ = EnrollFormWorkflowAsync(matchedUserId, true); }));
+            }
+            catch (Exception ex)
+            {
+                this.Invoke((Action)(() =>
+                {
+                    lblUser.Text = string.Empty;
+                    lblStatus.Text = "Scan error: " + ex.Message;
+                    lblStatus.ForeColor = Color.Red;
+                }));
+            }
+            finally
+            {
+                _isScanning = false;
+            }
+        }
+
+        private void RenderLiveFingerprintImage()
+        {
+            byte[] jpegBytes = _engine.LastCapturedFingerprintJpeg;
+            if (jpegBytes == null || jpegBytes.Length == 0) return;
+
+            try
+            {
+                using var ms = new MemoryStream(jpegBytes);
+                using var source = Image.FromStream(ms);
+                var nextImage = new Bitmap(source);
+                var oldImage = picFinger.Image;
+                picFinger.Image = nextImage;
+                oldImage?.Dispose();
+            }
+            catch
+            {
+                // Ignore preview rendering errors and keep scan workflow running.
+            }
+        }
+
+        private void HandleEmployeeFingerprint(UserModel employee)
+        {
+            bool canLog = _db.TryDetermineNextAttendanceEntry(
+                employee.Id,
+                TimeSpan.FromMinutes(DatabaseHelper.MinimumMinutesBetweenEmployeeTimeInAndTimeOut),
+                out string nextEntryType,
+                out DateTime? nextAllowedOutAt);
+
+            if (!canLog && string.Equals(nextEntryType, "OUT", StringComparison.OrdinalIgnoreCase) && nextAllowedOutAt.HasValue)
+            {
+                lblUser.Text = $"Employee Fingerprint Detected: {employee.FullName}";
+                lblStatus.Text = $"Time Out is locked. Scan again after {nextAllowedOutAt.Value:hh:mm tt}.";
+                lblStatus.ForeColor = Color.OrangeRed;
+                return;
+            }
+
+            _db.LogAttendance(employee.Id, nextEntryType);
+            string actionText = nextEntryType == "IN" ? "Time-in" : "Time-out";
+            lblUser.Text = $"{actionText} recorded for {employee.FullName}.";
+            lblStatus.Text = $"{actionText} logged at {DateTime.Now:hh:mm tt}";
+            lblStatus.ForeColor = Color.Blue;
+
+            _lastEmployeeStatusUserId = employee.Id;
+            _lastEmployeeStatusActionText = actionText;
+            _lastEmployeeStatusSetAt = DateTime.Now;
+            _lastEmployeeStatusRenderedName = employee.FullName;
+
+            _users = _db.GetAllUsersWithTemplates();
+        }
+
+        private void HandleReturningVisitorFingerprint(int fingerprintId)
+        {
+            if (_isReturningVisitorFlowOpen)
+                return;
+
+            _isReturningVisitorFlowOpen = true;
+            scanTimer.Stop();
+            try
+            {
+                var visitor = _db.GetVisitorProfile(fingerprintId);
+                if (visitor == null)
+                {
+                    lblUser.Text = string.Empty;
+                    lblStatus.Text = "Visitor fingerprint detected, but no saved visitor profile was found.";
+                    lblStatus.ForeColor = Color.OrangeRed;
+                    return;
+                }
+
+                using var purposeForm = new VisitorPurposeForm(visitor.FullName);
+                if (purposeForm.ShowDialog(this) != DialogResult.OK)
+                {
+                    lblUser.Text = string.Empty;
+                    lblStatus.Text = "Returning visitor scan cancelled.";
+                    lblStatus.ForeColor = Color.DarkCyan;
+                    return;
+                }
+
+                if (!_db.InsertExistingVisitorLog(visitor.FingerprintId, purposeForm.PurposeOfTransaction, string.Empty))
+                {
+                    lblUser.Text = string.Empty;
+                    lblStatus.Text = "Unable to save returning visitor logbook entry.";
+                    lblStatus.ForeColor = Color.OrangeRed;
+                    return;
+                }
+
+                lblUser.Text = $"Returning visitor logged: {visitor.FullName}";
+                lblStatus.Text = $"Visitor logbook entry saved at {DateTime.Now:hh:mm tt}";
+                lblStatus.ForeColor = Color.DarkCyan;
+            }
+            catch (Exception ex)
+            {
+                lblUser.Text = string.Empty;
+                lblStatus.Text = "Returning visitor scan error: " + ex.Message;
+                lblStatus.ForeColor = Color.OrangeRed;
+            }
+            finally
+            {
+                _isReturningVisitorFlowOpen = false;
+                scanTimer.Start();
+            }
+        }
+
+        private void clockTimer_Tick(object sender, EventArgs e)
+        {
+            UpdateClockDisplay();
+            RefreshLastEmployeeStatusNameIfChanged();
+        }
+
+        private void RefreshLastEmployeeStatusNameIfChanged()
+        {
+            if (!_lastEmployeeStatusUserId.HasValue || string.IsNullOrWhiteSpace(_lastEmployeeStatusActionText))
+                return;
+
+            // Only keep updating the green message for a short window after the last log action.
+            if ((DateTime.Now - _lastEmployeeStatusSetAt).TotalMinutes > 10)
+                return;
+
+            try
+            {
+                string latestName = _db.GetUserDisplayNameById(_lastEmployeeStatusUserId.Value);
+                if (string.IsNullOrWhiteSpace(latestName) || string.Equals(latestName, _lastEmployeeStatusRenderedName, StringComparison.Ordinal))
+                    return;
+
+                _lastEmployeeStatusRenderedName = latestName;
+                lblUser.Text = $"{latestName} has successfully {_lastEmployeeStatusActionText}.";
+            }
+            catch
+            {
+                // If DB is temporarily unavailable, don't break the UI clock updates.
+            }
+        }
+
+        private void UpdateClockDisplay()
+        {
+            DateTime now = DateTime.Now;
+            lblCurrentTime.Text = now.ToString("hh:mm:ss tt");
+            lblCurrentDate.Text = now.ToString("dddd, MMMM dd, yyyy");
+        }
+
+        private async void btnEnroll_Click(object sender, EventArgs e)
+        {
+            await EnrollFormWorkflowAsync(null, true);
+        }
+
+        /// <param name="staleZkfUserIdToRemove">If the scanner still holds a staff id that was deleted in MySQL, pass it to drop the orphan template before opening enrollment.</param>
+        private async Task EnrollFormWorkflowAsync(int? staleZkfUserIdToRemove, bool requireAdminLogin)
+        {
+            if (requireAdminLogin && !PromptForAdminLogin())
+                return;
+
+            if (staleZkfUserIdToRemove.HasValue)
+            {
+                lblUser.Text = string.Empty;
+                _engine.RemoveTemplateFromMemory(staleZkfUserIdToRemove.Value);
+                lblStatus.Text = "This print is not registered in the database. Enrolling a new user...";
+                lblStatus.ForeColor = Color.DarkCyan;
+            }
+            _isEnrollOpen = true;
+            scanTimer.Stop();
+            try
+            {
+                int waitedMs = 0;
+                while (_isScanning && waitedMs < 5000)
+                {
+                    await Task.Delay(100);
+                    waitedMs += 100;
+                }
+                var enrollForm = new EnrollForm(_engine, _db);
+                enrollForm.ShowDialog();
+                _users = _db.GetAllUsersWithTemplates();
+                _engine.LoadAllFingerprintsFromDatabase();
+            }
+            finally
+            {
+                _isEnrollOpen = false;
+                scanTimer.Start();
+            }
+        }
+
+        private bool PromptForAdminLogin()
+        {
+            if (!_db.HasAnyActiveAdmin())
+            {
+                MessageBox.Show(
+                    "No active admin account is available.\n\n" +
+                    "The app expects this default admin login:\n" +
+                    $"Default username: {DatabaseHelper.DefaultAdminUsername}\n" +
+                    $"Default password: {DatabaseHelper.DefaultAdminPassword}",
+                    "Admin Setup Required",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return false;
+            }
+
+            var method = PromptAuthMethodChoice(
+                "Admin Authentication",
+                "Choose how to authenticate",
+                allowCredentials: true,
+                allowFingerprint: true,
+                fingerprintLabel: "Use Admin Fingerprint");
+
+            if (!method.HasValue)
+                return false;
+
+            if (method.Value == AuthMethod.Credentials)
+            {
+                if (!TryPromptCredentials("Admin Login", "Admin authentication required", out string username, out string password))
+                    return false;
+
+                if (_db.ValidateAdminCredentials(username, password))
+                    return true;
+
+                MessageBox.Show(
+                    "Invalid admin username or password.",
+                    "Authentication Failed",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return false;
+            }
+
+            if (TryAuthenticateByFingerprint(
+                "Admin Fingerprint Authentication",
+                "Scan an admin fingerprint to continue",
+                out int userId) && _db.UserIdHasAnyRole(userId, "admin"))
+                return true;
+
+            MessageBox.Show(
+                "Fingerprint authentication failed or user is not an admin.",
+                "Authentication Failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return false;
+        }
+
+        private bool TryPromptAdminCredentials(out string username, out string password)
+        {
+            return TryPromptCredentials("Admin Login", "Admin authentication required", out username, out password);
+        }
+
+        private bool TryPromptCredentials(string dialogTitle, string promptTitle, out string username, out string password)
+        {
+            username = string.Empty;
+            password = string.Empty;
+
+            using var loginForm = new Form
+            {
+                Text = dialogTitle,
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.Sizable,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ShowInTaskbar = false,
+                MinimumSize = new Size(420, 300),
+                ClientSize = new Size(520, 320),
+                BackColor = Color.FromArgb(236, 241, 248),
+                AutoScaleMode = AutoScaleMode.Font,
+                Font = new Font("Segoe UI", 9.5F)
+            };
+            ResponsiveLayout.FitClientToWorkingArea(loginForm, 520, 340, 420, 300);
+
+            var panelHeader = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 78,
+                BackColor = Color.FromArgb(13, 27, 42)
+            };
+
+            var lblTitle = new Label
+            {
+                Text = promptTitle,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 12.5F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(240, 246, 255),
+                BackColor = Color.Transparent,
+                Location = new Point(18, 13)
+            };
+
+            var lblSub = new Label
+            {
+                Text = "Enter your credentials to continue",
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9.5F),
+                ForeColor = Color.FromArgb(154, 180, 209),
+                BackColor = Color.Transparent,
+                Location = new Point(20, 45)
+            };
+            panelHeader.Controls.Add(lblTitle);
+            panelHeader.Controls.Add(lblSub);
+
+            var panelBody = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Padding = new Padding(16, 14, 16, 8),
+                BackColor = Color.White
+            };
+
+            var lblUsername = new Label
+            {
+                Text = "USERNAME",
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Location = new Point(16, 16)
+            };
+            var txtUsername = new TextBox
+            {
+                Dock = DockStyle.Top,
+                Height = 30,
+                Font = new Font("Segoe UI", 10.5F),
+                BorderStyle = BorderStyle.FixedSingle,
+                BackColor = Color.FromArgb(248, 250, 252)
+            };
+
+            var lblPassword = new Label
+            {
+                Text = "PASSWORD",
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(100, 116, 139),
+                Location = new Point(16, 80)
+            };
+            var txtPassword = new TextBox
+            {
+                Dock = DockStyle.Top,
+                Height = 30,
+                Font = new Font("Segoe UI", 10.5F),
+                BorderStyle = BorderStyle.FixedSingle,
+                BackColor = Color.FromArgb(248, 250, 252),
+                UseSystemPasswordChar = true
+            };
+            lblUsername.AutoSize = false;
+            lblUsername.Dock = DockStyle.Top;
+            lblUsername.Height = 22;
+            lblPassword.AutoSize = false;
+            lblPassword.Dock = DockStyle.Top;
+            lblPassword.Height = 22;
+            lblPassword.Padding = new Padding(0, 10, 0, 0);
+
+            var btnLogin = new Button
+            {
+                Text = "Login",
+                Width = 122,
+                Height = 38,
+                DialogResult = DialogResult.OK,
+                BackColor = Color.FromArgb(37, 99, 235),
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand
+            };
+            btnLogin.FlatAppearance.BorderSize = 0;
+            btnLogin.FlatAppearance.MouseOverBackColor = Color.FromArgb(29, 78, 216);
+            btnLogin.FlatAppearance.MouseDownBackColor = Color.FromArgb(23, 64, 180);
+
+            var btnCancel = new Button
+            {
+                Text = "Cancel",
+                Width = 122,
+                Height = 38,
+                DialogResult = DialogResult.Cancel,
+                BackColor = Color.FromArgb(22, 40, 62),
+                ForeColor = Color.FromArgb(220, 230, 245),
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand
+            };
+            btnCancel.FlatAppearance.BorderSize = 0;
+            btnCancel.FlatAppearance.MouseOverBackColor = Color.FromArgb(30, 55, 85);
+            btnCancel.FlatAppearance.MouseDownBackColor = Color.FromArgb(15, 35, 60);
+
+            var buttonBar = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 58,
+                FlowDirection = FlowDirection.RightToLeft,
+                Padding = new Padding(12, 10, 12, 8),
+                BackColor = Color.FromArgb(236, 241, 248),
+                WrapContents = false
+            };
+            btnCancel.Margin = new Padding(0, 0, 0, 0);
+            btnLogin.Margin = new Padding(0, 0, 8, 0);
+            buttonBar.Controls.Add(btnCancel);
+            buttonBar.Controls.Add(btnLogin);
+
+            // Docked last is laid out first: button bar, then header, then the fields fill the middle.
+            panelBody.Controls.Add(txtPassword);
+            panelBody.Controls.Add(lblPassword);
+            panelBody.Controls.Add(txtUsername);
+            panelBody.Controls.Add(lblUsername);
+            loginForm.Controls.Add(panelBody);
+            loginForm.Controls.Add(buttonBar);
+            loginForm.Controls.Add(panelHeader);
+            loginForm.AcceptButton = btnLogin;
+            loginForm.CancelButton = btnCancel;
+
+            if (loginForm.ShowDialog(this) != DialogResult.OK)
+                return false;
+
+            username = txtUsername.Text?.Trim() ?? string.Empty;
+            password = txtPassword.Text ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+            {
+                MessageBox.Show("Enter admin username and password.", "Validation",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
+            }
+            return true;
+        }
+
+        private void btnLogs_Click(object sender, EventArgs e)
+        {
+            var logForm = new AttendanceLogForm(_db);
+            logForm.ShowDialog();
+        }
+
+        private void btnVisitorLogbook_Click(object sender, EventArgs e)
+        {
+            using var logbookForm = new VisitorLogbookForm(_db, _engine, PromptForLogbookPrivilegedLogin)
+            {
+                Owner = this
+            };
+            logbookForm.ShowDialog();
+        }
+
+        /// <summary>
+        /// Visitor logbook grid exposes visitor PII — restrict to <c>admin</c> or <see cref="DatabaseHelper.RoleLogbookPrivileged"/> accounts.
+        /// </summary>
+        private bool PromptForLogbookPrivilegedLogin()
+        {
+            if (!_db.HasAnyActiveUserForRoles("admin", DatabaseHelper.RoleLogbookPrivileged))
+            {
+                MessageBox.Show(
+                    "No staff account is configured for visitor logbook access.\n\n" +
+                    "An administrator must assign the \"admin\" or \"logbook\" role to your user in the database.",
+                    "Cannot Authenticate",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return false;
+            }
+
+            var method = PromptAuthMethodChoice(
+                "Visitor Logbook Access",
+                "Authenticate to view visitor records",
+                allowCredentials: true,
+                allowFingerprint: true,
+                fingerprintLabel: "Scan authorized fingerprint");
+
+            if (!method.HasValue)
+                return false;
+
+            if (method.Value == AuthMethod.Credentials)
+            {
+                if (!TryPromptCredentials(
+                    "Visitor Logbook Login",
+                    "Admin or authorized logbook personnel",
+                    out string username,
+                    out string password))
+                    return false;
+
+                if (_db.ValidateCredentialsForRoles(username, password, "admin", DatabaseHelper.RoleLogbookPrivileged))
+                    return true;
+
+                MessageBox.Show(
+                    "Invalid credentials or this account cannot access visitor records.",
+                    "Authentication Failed",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return false;
+            }
+
+            if (TryAuthenticateByFingerprint(
+                    "Visitor Logbook",
+                    "Scan an admin or authorized logbook fingerprint",
+                    out int userId) &&
+                _db.UserIdHasAnyRole(userId, "admin", DatabaseHelper.RoleLogbookPrivileged))
+                return true;
+
+            MessageBox.Show(
+                "Fingerprint authentication failed or this account cannot access visitor records.",
+                "Authentication Failed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return false;
+        }
+
+        private enum AuthMethod
+        {
+            Credentials,
+            Fingerprint
+        }
+
+        private AuthMethod? PromptAuthMethodChoice(
+            string dialogTitle,
+            string promptTitle,
+            bool allowCredentials,
+            bool allowFingerprint,
+            string fingerprintLabel)
+        {
+            using var methodForm = new Form
+            {
+                Text = dialogTitle,
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.Sizable,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ShowInTaskbar = false,
+                MinimumSize = new Size(420, 280),
+                ClientSize = new Size(560, 320),
+                BackColor = Color.FromArgb(236, 241, 248),
+                KeyPreview = true,
+                AutoScaleMode = AutoScaleMode.Font,
+                Font = new Font("Segoe UI", 9.5F)
+            };
+            ResponsiveLayout.FitClientToWorkingArea(methodForm, 560, 320, 420, 280);
+
+            var panelHeader = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 78,
+                BackColor = Color.FromArgb(13, 27, 42)
+            };
+            var lblTitle = new Label
+            {
+                Text = promptTitle,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 12.5F, FontStyle.Bold),
+                ForeColor = Color.FromArgb(240, 246, 255),
+                BackColor = Color.Transparent,
+                Location = new Point(18, 13)
+            };
+            var lblSub = new Label
+            {
+                Text = "Select one option below",
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9.5F),
+                ForeColor = Color.FromArgb(154, 180, 209),
+                BackColor = Color.Transparent,
+                Location = new Point(20, 45)
+            };
+            panelHeader.Controls.Add(lblTitle);
+            panelHeader.Controls.Add(lblSub);
+
+            var panelBody = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Padding = new Padding(18, 16, 18, 8),
+                BackColor = Color.White
+            };
+
+            var btnCredentials = new Button
+            {
+                Text = "Type Credentials",
+                Dock = DockStyle.Top,
+                Height = 52,
+                BackColor = Color.FromArgb(37, 99, 235),
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 10.5F, FontStyle.Bold),
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand,
+                Enabled = allowCredentials
+            };
+            btnCredentials.FlatAppearance.BorderSize = 0;
+            btnCredentials.Click += (_, __) => methodForm.DialogResult = DialogResult.OK;
+
+            var btnFingerprint = new Button
+            {
+                Text = fingerprintLabel ?? "Use Fingerprint",
+                Dock = DockStyle.Top,
+                Height = 52,
+                Margin = new Padding(0, 10, 0, 0),
+                BackColor = Color.FromArgb(22, 40, 62),
+                ForeColor = Color.FromArgb(220, 230, 245),
+                Font = new Font("Segoe UI", 10.5F, FontStyle.Bold),
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand,
+                Enabled = allowFingerprint
+            };
+            btnFingerprint.FlatAppearance.BorderSize = 0;
+            btnFingerprint.Click += (_, __) => methodForm.DialogResult = DialogResult.Yes;
+
+            var choiceGap = new Panel { Dock = DockStyle.Top, Height = 10 };
+            panelBody.Controls.Add(btnFingerprint);
+            panelBody.Controls.Add(choiceGap);
+            panelBody.Controls.Add(btnCredentials);
+
+            var btnCancel = new Button
+            {
+                Text = "Cancel",
+                Width = 122,
+                Height = 38,
+                DialogResult = DialogResult.Cancel,
+                BackColor = Color.FromArgb(30, 55, 85),
+                ForeColor = Color.FromArgb(220, 230, 245),
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand
+            };
+            btnCancel.FlatAppearance.BorderSize = 0;
+
+            var buttonBar = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 58,
+                FlowDirection = FlowDirection.RightToLeft,
+                Padding = new Padding(12, 10, 12, 8),
+                WrapContents = false,
+                BackColor = Color.FromArgb(236, 241, 248)
+            };
+            buttonBar.Controls.Add(btnCancel);
+            methodForm.Controls.Add(panelBody);
+            methodForm.Controls.Add(buttonBar);
+            methodForm.Controls.Add(panelHeader);
+            methodForm.CancelButton = btnCancel;
+            methodForm.KeyDown += (_, e) =>
+            {
+                if (e.KeyCode != Keys.Escape) return;
+                methodForm.DialogResult = DialogResult.Cancel;
+                methodForm.Close();
+            };
+
+            var result = methodForm.ShowDialog(this);
+            if (result == DialogResult.OK)
+                return AuthMethod.Credentials;
+            if (result == DialogResult.Yes)
+                return AuthMethod.Fingerprint;
+            return null;
+        }
+
+        private bool TryAuthenticateByFingerprint(string dialogTitle, string promptText, out int userId)
+        {
+            userId = -1;
+
+            if (_engine == null || !_engine.IsConnected)
+            {
+                MessageBox.Show(
+                    "Fingerprint device is not connected.",
+                    "Device Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return false;
+            }
+
+            scanTimer.Stop();
+            try
+            {
+                int waitedMs = 0;
+                while (_isScanning && waitedMs < 5000)
+                {
+                    Application.DoEvents();
+                    System.Threading.Thread.Sleep(50);
+                    waitedMs += 50;
+                }
+
+                using var scanForm = new Form
+                {
+                    Text = dialogTitle,
+                    StartPosition = FormStartPosition.CenterParent,
+                    FormBorderStyle = FormBorderStyle.Sizable,
+                    MaximizeBox = false,
+                    MinimizeBox = false,
+                    ShowInTaskbar = false,
+                    MinimumSize = new Size(420, 240),
+                    ClientSize = new Size(560, 260),
+                    BackColor = Color.FromArgb(236, 241, 248),
+                    KeyPreview = true,
+                    AutoScaleMode = AutoScaleMode.Font,
+                    Font = new Font("Segoe UI", 9.5F)
+                };
+                ResponsiveLayout.FitClientToWorkingArea(scanForm, 560, 260, 420, 240);
+
+                var panelHeader = new Panel
+                {
+                    Dock = DockStyle.Top,
+                    Height = 78,
+                    BackColor = Color.FromArgb(13, 27, 42)
+                };
+                var lblTitle = new Label
+                {
+                    Text = "Fingerprint authentication",
+                    AutoSize = true,
+                    Font = new Font("Segoe UI", 12.5F, FontStyle.Bold),
+                    ForeColor = Color.FromArgb(240, 246, 255),
+                    BackColor = Color.Transparent,
+                    Location = new Point(18, 13)
+                };
+                var lblSub = new Label
+                {
+                    Text = promptText ?? "Scan fingerprint to continue",
+                    AutoSize = true,
+                    Font = new Font("Segoe UI", 9.5F),
+                    ForeColor = Color.FromArgb(154, 180, 209),
+                    BackColor = Color.Transparent,
+                    Location = new Point(20, 45)
+                };
+                panelHeader.Controls.Add(lblTitle);
+                panelHeader.Controls.Add(lblSub);
+
+                var panelBody = new Panel
+                {
+                    Dock = DockStyle.Fill,
+                    Padding = new Padding(18, 16, 18, 8),
+                    BackColor = Color.White
+                };
+                var lblStatus = new Label
+                {
+                    Text = "Place finger on scanner…",
+                    Dock = DockStyle.Fill,
+                    Font = new Font("Segoe UI", 11F),
+                    ForeColor = Color.FromArgb(30, 41, 59),
+                    TextAlign = ContentAlignment.MiddleLeft
+                };
+                panelBody.Controls.Add(lblStatus);
+
+                var btnCancel = new Button
+                {
+                    Text = "Cancel",
+                    Width = 122,
+                    Height = 38,
+                    DialogResult = DialogResult.Cancel,
+                    BackColor = Color.FromArgb(22, 40, 62),
+                    ForeColor = Color.FromArgb(220, 230, 245),
+                    Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                    FlatStyle = FlatStyle.Flat,
+                    Cursor = Cursors.Hand
+                };
+                btnCancel.FlatAppearance.BorderSize = 0;
+
+                var buttonBar = new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Bottom,
+                    Height = 58,
+                    FlowDirection = FlowDirection.RightToLeft,
+                    Padding = new Padding(12, 10, 12, 8),
+                    WrapContents = false,
+                    BackColor = Color.FromArgb(236, 241, 248)
+                };
+                buttonBar.Controls.Add(btnCancel);
+                scanForm.Controls.Add(panelBody);
+                scanForm.Controls.Add(buttonBar);
+                scanForm.Controls.Add(panelHeader);
+                scanForm.CancelButton = btnCancel;
+                scanForm.KeyDown += (_, e) =>
+                {
+                    if (e.KeyCode != Keys.Escape) return;
+                    scanForm.DialogResult = DialogResult.Cancel;
+                    scanForm.Close();
+                };
+
+                int matchedId = -1;
+
+                // Run scan in background so UI stays responsive.
+                var scanTask = System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        return _engine.IdentifyUser(timeoutMs: 15000);
+                    }
+                    catch
+                    {
+                        return -1;
+                    }
+                });
+
+                scanTask.ContinueWith(t =>
+                {
+                    if (scanForm.IsDisposed) return;
+                    scanForm.BeginInvoke((Action)(() =>
+                    {
+                        matchedId = t.Result;
+                        scanForm.DialogResult = matchedId > 0 ? DialogResult.OK : DialogResult.None;
+                        scanForm.Close();
+                    }));
+                });
+
+                var result = scanForm.ShowDialog(this);
+                if (result != DialogResult.OK)
+                    return false;
+
+                userId = matchedId;
+                if (userId <= 0)
+                {
+                    MessageBox.Show(
+                        string.IsNullOrWhiteSpace(_engine.LastError) ? "Fingerprint not recognised." : _engine.LastError,
+                        "Authentication Failed",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return false;
+                }
+
+                return true;
+            }
+            finally
+            {
+                scanTimer.Start();
+            }
+        }
+
+        private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            clockTimer.Stop();
+            scanTimer.Stop();
+            _engine?.Dispose();
+        }
+
+    }
+}

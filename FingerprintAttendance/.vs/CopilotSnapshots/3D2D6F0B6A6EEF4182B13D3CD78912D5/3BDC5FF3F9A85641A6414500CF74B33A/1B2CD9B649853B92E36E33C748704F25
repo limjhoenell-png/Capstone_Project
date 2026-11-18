@@ -1,0 +1,120 @@
+﻿using BioLogbook;
+using FingerprintAttendance.Core;
+using FingerprintAttendance.Models;
+using Org.BouncyCastle.Asn1.Cmp;
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Windows.Forms;
+
+namespace FingerprintAttendance.Forms
+{
+    public partial class MainForm : Form
+    {
+        private FingerprintEngine _engine = new FingerprintEngine();
+        private DatabaseHelper _db = new DatabaseHelper();
+        private List<UserModel> _users;
+        private string _pendingEntryType = "IN";
+
+        public MainForm()
+        {
+            InitializeComponent();
+        }
+
+        private void MainForm_Load(object sender, EventArgs e)
+        {
+            // Test DB connection
+            if (!_db.TestConnection())
+            {
+                MessageBox.Show(
+                    "Cannot connect to MySQL!\n\nMake sure XAMPP is running and MySQL is started.",
+                    "Database Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Application.Exit();
+                return;
+            }
+
+            // Initialize fingerprint device
+            try
+            {
+                _engine.Initialize();
+                lblStatus.Text = "Device ready. Place finger to scan.";
+                lblStatus.ForeColor = Color.Green;
+                _users = _db.GetAllUsersWithTemplates();
+                scanTimer.Start();
+            }
+            catch (Exception ex)
+            {
+                lblStatus.Text = "Device not found: " + ex.Message;
+                lblStatus.ForeColor = Color.Red;
+            }
+        }
+
+        // Called every 500ms — polls for a fingerprint
+        private void scanTimer_Tick(object sender, EventArgs e)
+        {
+            byte[] liveScan = _engine.CaptureScan();
+            if (liveScan == null) return;   // no finger
+
+            // Search for a match
+            foreach (var user in _users)
+            {
+                if (user.FpTemplate == null) continue;
+                int score = _engine.MatchTemplates(liveScan, user.FpTemplate);
+
+                if (score > FingerprintEngine.MATCH_THRESHOLD)
+                {
+                    // Match found
+                    _db.LogAttendance(user.Id, _pendingEntryType);
+                    lblUser.Text = $"Welcome, {user.FullName}!";
+                    lblStatus.Text = $"{_pendingEntryType} logged at {DateTime.Now:hh:mm tt}";
+                    lblStatus.ForeColor = Color.Blue;
+
+                    // Reload templates in case of changes
+                    _users = _db.GetAllUsersWithTemplates();
+                    return;
+                }
+            }
+
+            // No match
+            lblStatus.Text = "Fingerprint not recognized. Try again.";
+            lblStatus.ForeColor = Color.OrangeRed;
+        }
+
+        private void btnIN_Click(object sender, EventArgs e)
+        {
+            _pendingEntryType = "IN";
+            btnIN.BackColor = Color.LightGreen;
+            btnOUT.BackColor = SystemColors.Control;
+            lblStatus.Text = "Mode: Logging IN. Place finger.";
+        }
+
+        private void btnOUT_Click(object sender, EventArgs e)
+        {
+            _pendingEntryType = "OUT";
+            btnOUT.BackColor = Color.LightCoral;
+            btnIN.BackColor = SystemColors.Control;
+            lblStatus.Text = "Mode: Logging OUT. Place finger.";
+        }
+
+        private void btnEnroll_Click(object sender, EventArgs e)
+        {
+            scanTimer.Stop();
+            var enrollForm = new EnrollForm(_engine, _db);
+            enrollForm.ShowDialog();
+            _users = _db.GetAllUsersWithTemplates(); // refresh after enroll
+            scanTimer.Start();
+        }
+
+        private void btnLogs_Click(object sender, EventArgs e)
+        {
+            var logForm = new AttendanceLogForm(_db);
+            logForm.ShowDialog();
+        }
+
+        private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            scanTimer.Stop();
+            _engine?.Dispose();
+        }
+    }
+}

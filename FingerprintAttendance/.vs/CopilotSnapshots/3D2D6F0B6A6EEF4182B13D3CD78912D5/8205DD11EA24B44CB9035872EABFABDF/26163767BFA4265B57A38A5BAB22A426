@@ -1,0 +1,149 @@
+﻿using FingerprintAttendance.Core;
+using System;
+using System.Drawing;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace FingerprintAttendance
+{
+    public partial class EnrollForm : Form
+    {
+        private FingerprintEngine _engine;
+        private DatabaseHelper _db;
+        private byte[] _scan1, _scan2, _scan3;
+        private int _scanCount = 0;
+        private bool _isCapturing = false;
+
+        public EnrollForm(FingerprintEngine engine, DatabaseHelper db)
+        {
+            InitializeComponent();
+            _engine = engine;
+            _db = db;
+        }
+
+        private void btnStartEnroll_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(txtFullName.Text))
+            {
+                MessageBox.Show("Please enter the full name.");
+                return;
+            }
+
+            _scanCount = 0;
+            progressBar.Value = 0;
+            btnStartEnroll.Enabled = false;
+            lblScanStatus.Text = "Place finger on scanner (1 of 3)...";
+            lblScanStatus.ForeColor = Color.Blue;
+
+            // Start the enrollment process on a background thread
+            Task.Run(() => CaptureNextScan());
+        }
+
+        private void CaptureNextScan()
+        {
+            if (_isCapturing) return;
+            _isCapturing = true;
+
+            try
+            {
+                // Capture on background thread - this blocks but doesn't freeze UI
+                byte[] scan = _engine.CaptureScan();
+
+                // Update UI back on the UI thread
+                this.Invoke((Action)(() =>
+                {
+                    if (scan == null)
+                    {
+                        MessageBox.Show("Failed to capture fingerprint. Please try again.");
+                        ResetEnrollment();
+                        return;
+                    }
+
+                    _scanCount++;
+                    progressBar.Value = _scanCount;
+
+                    if (_scanCount == 1)
+                    {
+                        _scan1 = scan;
+                        lblScanStatus.Text = "Good! Lift finger. Place again (2 of 3)...";
+                        lblScanStatus.ForeColor = Color.Blue;
+                    }
+                    else if (_scanCount == 2)
+                    {
+                        _scan2 = scan;
+                        lblScanStatus.Text = "Good! Lift finger. Place again (3 of 3)...";
+                        lblScanStatus.ForeColor = Color.Blue;
+                    }
+                    else if (_scanCount == 3)
+                    {
+                        _scan3 = scan;
+                        CompleteEnrollment();
+                        return;
+                    }
+
+                    // Continue to next scan after a short delay
+                    System.Threading.Thread.Sleep(500);
+                    _isCapturing = false;
+                    Task.Run(() => CaptureNextScan());
+                }));
+            }
+            catch (Exception ex)
+            {
+                this.Invoke((Action)(() =>
+                {
+                    MessageBox.Show("Capture error: " + ex.Message);
+                    ResetEnrollment();
+                }));
+            }
+            finally
+            {
+                _isCapturing = false;
+            }
+        }
+
+        private void CompleteEnrollment()
+        {
+            try
+            {
+                byte[] regTemplate = _engine.MergeTemplates(_scan1, _scan2, _scan3);
+
+                if (regTemplate == null)
+                {
+                    MessageBox.Show("Enrollment failed. Scans inconsistent. Please try again.");
+                    ResetEnrollment();
+                    return;
+                }
+
+                // Save to database
+                int newId = _db.EnrollUser(
+                    txtFullName.Text.Trim(),
+                    txtEmpId.Text.Trim(),
+                    regTemplate);
+
+                lblScanStatus.Text = $"Enrolled! User ID: {newId}";
+                lblScanStatus.ForeColor = Color.Green;
+                MessageBox.Show($"{txtFullName.Text} enrolled successfully!", "Success");
+                this.Close();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Database error: " + ex.Message);
+                ResetEnrollment();
+            }
+        }
+
+        private void ResetEnrollment()
+        {
+            _scanCount = 0;
+            progressBar.Value = 0;
+            btnStartEnroll.Enabled = true;
+            lblScanStatus.Text = "Enrollment cancelled. Enter name and try again.";
+            lblScanStatus.ForeColor = Color.Red;
+        }
+
+        private void btnCancel_Click(object sender, EventArgs e)
+        {
+            this.Close();
+        }
+    }
+}

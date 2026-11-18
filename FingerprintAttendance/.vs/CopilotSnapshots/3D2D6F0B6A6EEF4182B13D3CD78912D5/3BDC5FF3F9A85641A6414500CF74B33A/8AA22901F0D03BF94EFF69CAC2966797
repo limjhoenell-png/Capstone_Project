@@ -1,0 +1,91 @@
+﻿using BioLogbook;
+using FingerprintAttendance.Core;
+using System;
+using System.Drawing;
+using System.Windows.Forms;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement;
+
+namespace FingerprintAttendance.Forms
+{
+    public partial class EnrollForm : Form
+    {
+        private FingerprintEngine _engine;
+        private DatabaseHelper _db;
+        private byte[] _scan1, _scan2, _scan3;
+        private int _scanCount = 0;
+        private Timer _enrollTimer = new Timer();
+
+        public EnrollForm(FingerprintEngine engine, DatabaseHelper db)
+        {
+            InitializeComponent();
+            _engine = engine;
+            _db = db;
+            _enrollTimer.Interval = 600;
+            _enrollTimer.Tick += EnrollTimer_Tick;
+        }
+
+        private void btnStartEnroll_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(txtFullName.Text))
+            {
+                MessageBox.Show("Please enter the full name.");
+                return;
+            }
+
+            _scanCount = 0;
+            progressBar.Value = 0;
+            btnStartEnroll.Enabled = false;
+            lblScanStatus.Text = "Place finger on scanner (1 of 3)...";
+            lblScanStatus.ForeColor = Color.Blue;
+            _enrollTimer.Start();
+        }
+
+        private void EnrollTimer_Tick(object sender, EventArgs e)
+        {
+            byte[] scan = _engine.CaptureScan();
+            if (scan == null) return;  // waiting for finger
+
+            _enrollTimer.Stop();
+            _scanCount++;
+            progressBar.Value = _scanCount;
+
+            if (_scanCount == 1) { _scan1 = scan; lblScanStatus.Text = "Good! Lift finger. Place again (2 of 3)..."; }
+            if (_scanCount == 2) { _scan2 = scan; lblScanStatus.Text = "Good! Lift finger. Place again (3 of 3)..."; }
+            if (_scanCount == 3)
+            {
+                _scan3 = scan;
+                byte[] regTemplate = _engine.MergeTemplates(_scan1, _scan2, _scan3);
+
+                if (regTemplate == null)
+                {
+                    MessageBox.Show("Enrollment failed. Scans inconsistent. Please try again.");
+                    btnStartEnroll.Enabled = true;
+                    _scanCount = 0;
+                    progressBar.Value = 0;
+                    return;
+                }
+
+                // Save to database
+                int newId = _db.EnrollUser(
+                    txtFullName.Text.Trim(),
+                    txtEmpId.Text.Trim(),
+                    regTemplate);
+
+                lblScanStatus.Text = $"Enrolled! User ID: {newId}";
+                lblScanStatus.ForeColor = Color.Green;
+                MessageBox.Show($"{txtFullName.Text} enrolled successfully!", "Success");
+                this.Close();
+                return;
+            }
+
+            // Continue to next scan
+            _enrollTimer.Start();
+        }
+
+        private void btnCancel_Click(object sender, EventArgs e)
+        {
+            _enrollTimer.Stop();
+            this.Close();
+        }
+    }
+}

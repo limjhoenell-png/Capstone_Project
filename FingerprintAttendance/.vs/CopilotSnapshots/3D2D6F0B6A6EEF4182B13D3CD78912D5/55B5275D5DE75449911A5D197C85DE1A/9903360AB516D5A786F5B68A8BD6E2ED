@@ -1,0 +1,1348 @@
+﻿using System;
+using System.Collections.Generic;
+using MySql.Data.MySqlClient;
+using FingerprintAttendance.Models;
+using Org.BouncyCastle.Crypto.Generators;
+
+namespace FingerprintAttendance.Core
+{
+    public class VisitorProfile
+    {
+        public int FingerprintId { get; set; }
+        public string FullName { get; set; }
+        public string Address { get; set; }
+        public string ContactNumber { get; set; }
+        public string OfficeOrPersonToVisit { get; set; }
+
+        /// <summary>True if any saved logbook row for this visitor has a fingerprint template.</summary>
+        public bool HasFingerprintOnFile { get; set; }
+    }
+
+    /// <summary>One row from visitor identity search (latest visitor-type log per fingerprint id).</summary>
+    public class VisitorIdentityPickRow
+    {
+        public int FingerprintId { get; set; }
+        public string FullName { get; set; }
+        public string Address { get; set; }
+        public string ContactNumber { get; set; }
+        public DateTime LastVisit { get; set; }
+        public bool HasFingerprintOnFile { get; set; }
+    }
+
+    public class VisitorLogEntry
+    {
+        public int LogbookId { get; set; }
+        public string FullName { get; set; }
+        public string Address { get; set; }
+        public string ContactNumber { get; set; }
+        public string PurposeOfTransaction { get; set; }
+        public string OfficeOrPersonToVisit { get; set; }
+        /// <summary>See <see cref="DatabaseHelper.LogbookTransactionTypeVisitor"/> and <see cref="DatabaseHelper.LogbookTransactionTypeDocumentClaimBehalf"/>.</summary>
+        public string TransactionType { get; set; }
+
+        /// <summary>Friendly label for grids (derived from <see cref="TransactionType"/>).</summary>
+        public string TransactionTypeLabel => DatabaseHelper.FormatLogbookTransactionTypeLabel(TransactionType);
+        public bool IsAuthorizedRepresentative { get; set; }
+        public bool AuthorizationLetterVerified { get; set; }
+        public bool ValidIdVerified { get; set; }
+        public string RepresentedPersonName { get; set; }
+        /// <summary>Visitor biometric id (900000+ range) when enrolled; null when the logbook row has no fingerprint registration.</summary>
+        public int? FingerprintId { get; set; }
+        public DateTime TimeIn { get; set; }
+
+        /// <summary>True if this visitor profile has any saved fingerprint template (any logbook row for the same <see cref="FingerprintId"/>).</summary>
+        public bool HasFingerprintOnFile { get; set; }
+
+        /// <summary>Display text for grids (same rule as <see cref="HasFingerprintOnFile"/>).</summary>
+        public string FingerprintEnrollmentLabel => HasFingerprintOnFile ? "Enrolled" : "Not enrolled";
+
+        /// <summary>Detail / export text for fingerprint id column.</summary>
+        public string FingerprintIdDisplay => FingerprintId.HasValue ? FingerprintId.Value.ToString() : "No fingerprint ID";
+    }
+
+    public class DatabaseHelper
+    {
+        public const int MinimumMinutesBetweenEmployeeTimeInAndTimeOut = 1;
+
+        /// <summary>Visitor / logbook fingerprint IDs are allocated in this range (see GetNextVisitorFingerprintId).</summary>
+        public const int VisitorFingerprintIdRangeStart = 900000;
+
+        /// <summary>Standard visitor or resident logbook entry.</summary>
+        public const string LogbookTransactionTypeVisitor = "visitor";
+
+        /// <summary>Someone claiming barangay documents on behalf of another person (authorization letter + valid IDs required).</summary>
+        public const string LogbookTransactionTypeDocumentClaimBehalf = "document_claim_behalf";
+
+        /// <summary>Privileged staff who may view full visitor logbook entries (PII). Use with <c>admin</c> in auth checks.</summary>
+        public const string RoleLogbookPrivileged = "logbook";
+
+        /// <summary>Short label for grids and detail dialogs.</summary>
+        public static string FormatLogbookTransactionTypeLabel(string transactionType)
+        {
+            if (string.Equals(transactionType, LogbookTransactionTypeDocumentClaimBehalf, StringComparison.OrdinalIgnoreCase))
+                return "Document claim (on behalf)";
+            return "Visitor";
+        }
+        public const string DefaultAdminUsername = "admin@gmail.com";
+        public const string DefaultAdminPassword = "admin@gmail.com";
+
+        /// <summary>Shown when a new person cannot be saved because full name and complete address already exist.</summary>
+        public const string PersonAlreadyRegisteredMessage =
+            "This person is already registered. A record with the same full name and complete address already exists. Search for the existing record to view or update it. A duplicate will not be created.";
+
+        /// <summary>Set after a failed <see cref="TestConnection"/> for diagnostics (shown in the startup dialog).</summary>
+        public string LastConnectionFailureDetail { get; private set; }
+
+        /// <summary>DDL and CREATE DATABASE run once per process so polling does not open a server connection every tick.</summary>
+        private static bool _schemaReady;
+        private static readonly object _schemaLock = new object();
+
+        /// <summary>Creates the database if it does not exist (MySQL must be running).</summary>
+        private void EnsureDatabaseCreated()
+        {
+            using var conn = new MySqlConnection(AppDbConnection.ServerConnectionString);
+            conn.Open();
+            using var cmd = new MySqlCommand(
+                $"CREATE DATABASE IF NOT EXISTS `{AppDbConnection.DatabaseName}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
+                conn);
+            cmd.ExecuteNonQuery();
+        }
+
+        private void EnsureCoreTables(MySqlConnection conn)
+        {
+            const string usersSql = @"
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    full_name VARCHAR(150) NOT NULL,
+                    employee_id VARCHAR(50) NULL,
+                    fp_template LONGBLOB NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_users_employee_id (employee_id)
+                ) ENGINE=InnoDB;";
+            using (var cmd = new MySqlCommand(usersSql, conn))
+                cmd.ExecuteNonQuery();
+
+            // No FOREIGN KEY: errno 150 if an older `users` table is MyISAM or `id` type differs from user_id.
+            const string attendanceSql = @"
+                CREATE TABLE IF NOT EXISTS attendance_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    entry_type VARCHAR(10) NOT NULL,
+                    log_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_attendance_user_id (user_id),
+                    INDEX idx_attendance_log_time (log_time)
+                ) ENGINE=InnoDB;";
+            using (var cmd = new MySqlCommand(attendanceSql, conn))
+                cmd.ExecuteNonQuery();
+
+        }
+
+        private static void ExecuteNonQuery(MySqlConnection conn, string sql)
+        {
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.ExecuteNonQuery();
+        }
+
+        private static void EnsureDefaultAdminAccount(MySqlConnection conn)
+        {
+            bool hasEmail = ColumnExists(conn, "users", "email");
+            bool hasUsername = ColumnExists(conn, "users", "username");
+            bool hasFullName = ColumnExists(conn, "users", "full_name");
+            bool hasName = ColumnExists(conn, "users", "name");
+            bool hasPassword = ColumnExists(conn, "users", "password");
+
+            string loginColumn = hasEmail ? "email" : hasUsername ? "username" : null;
+            if (string.IsNullOrWhiteSpace(loginColumn))
+                return;
+
+            // If any admin already exists, do not change roles/passwords.
+            const string anyAdminSql = "SELECT COUNT(1) FROM users WHERE role = 'admin'";
+            using (var anyAdminCmd = new MySqlCommand(anyAdminSql, conn))
+            {
+                if (Convert.ToInt32(anyAdminCmd.ExecuteScalar()) > 0)
+                    return;
+            }
+
+            if (hasUsername && hasEmail)
+            {
+                const string syncUsernameSql = "UPDATE users SET username = @login WHERE email = @login AND (username IS NULL OR username = '')";
+                using var syncUsernameCmd = new MySqlCommand(syncUsernameSql, conn);
+                syncUsernameCmd.Parameters.AddWithValue("@login", DefaultAdminUsername);
+                syncUsernameCmd.ExecuteNonQuery();
+            }
+
+            if (hasPassword)
+            {
+                string syncPasswordSql = $"UPDATE users SET password = @password WHERE {loginColumn} = @login AND (password IS NULL OR password = '')";
+                using var passwordCmd = new MySqlCommand(syncPasswordSql, conn);
+                passwordCmd.Parameters.AddWithValue("@login", DefaultAdminUsername);
+                passwordCmd.Parameters.AddWithValue("@password", DefaultAdminPassword);
+                passwordCmd.ExecuteNonQuery();
+            }
+
+            if (hasFullName)
+            {
+                string fullNameSql = $"UPDATE users SET full_name = 'System Administrator' WHERE {loginColumn} = @login AND (full_name IS NULL OR full_name = '')";
+                using var fullNameCmd = new MySqlCommand(fullNameSql, conn);
+                fullNameCmd.Parameters.AddWithValue("@login", DefaultAdminUsername);
+                fullNameCmd.ExecuteNonQuery();
+            }
+            else if (hasName)
+            {
+                string nameSql = $"UPDATE users SET name = 'System Administrator' WHERE {loginColumn} = @login AND (name IS NULL OR name = '')";
+                using var nameCmd = new MySqlCommand(nameSql, conn);
+                nameCmd.Parameters.AddWithValue("@login", DefaultAdminUsername);
+                nameCmd.ExecuteNonQuery();
+            }
+
+            string existingTargetAdminSql = $@"
+                SELECT COUNT(1)
+                FROM users
+                WHERE {loginColumn} = @login
+                  AND role = 'admin'";
+            using (var checkCmd = new MySqlCommand(existingTargetAdminSql, conn))
+            {
+                checkCmd.Parameters.AddWithValue("@login", DefaultAdminUsername);
+                if (Convert.ToInt32(checkCmd.ExecuteScalar()) > 0)
+                    return;
+            }
+
+            // Promote the default login if it already exists (by email/username).
+            string promoteSql = $"UPDATE users SET role = 'admin' WHERE {loginColumn} = @login";
+            using (var promoteCmd = new MySqlCommand(promoteSql, conn))
+            {
+                promoteCmd.Parameters.AddWithValue("@login", DefaultAdminUsername);
+                int updated = promoteCmd.ExecuteNonQuery();
+                if (updated > 0)
+                    return;
+            }
+
+            string insertColumns = hasFullName ? "full_name, employee_id, fp_template, role, password, " + loginColumn
+                : hasName ? "name, employee_id, fp_template, role, password, " + loginColumn
+                : "employee_id, fp_template, role, password, " + loginColumn;
+            string insertValues = hasFullName ? "@displayName, NULL, NULL, 'admin', @password, @login"
+                : hasName ? "@displayName, NULL, NULL, 'admin', @password, @login"
+                : "NULL, NULL, 'admin', @password, @login";
+            string seedAdminSql = $"INSERT INTO users ({insertColumns}) VALUES ({insertValues})";
+            using var insertCmd = new MySqlCommand(seedAdminSql, conn);
+            insertCmd.Parameters.AddWithValue("@displayName", "System Administrator");
+            insertCmd.Parameters.AddWithValue("@login", DefaultAdminUsername);
+            insertCmd.Parameters.AddWithValue("@password", DefaultAdminPassword);
+            insertCmd.ExecuteNonQuery();
+        }
+
+        private static bool TableExists(MySqlConnection conn, string table)
+        {
+            using var cmd = new MySqlCommand(
+                @"SELECT 1 FROM information_schema.TABLES
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @t LIMIT 1",
+                conn);
+            cmd.Parameters.AddWithValue("@t", table);
+            return cmd.ExecuteScalar() != null;
+        }
+
+        private static bool ColumnExists(MySqlConnection conn, string table, string column)
+        {
+            using var cmd = new MySqlCommand(
+                @"SELECT 1 FROM information_schema.COLUMNS
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = @tbl AND COLUMN_NAME = @col LIMIT 1",
+                conn);
+            cmd.Parameters.AddWithValue("@tbl", table);
+            cmd.Parameters.AddWithValue("@col", column);
+            return cmd.ExecuteScalar() != null;
+        }
+
+        /// <summary>
+        /// Older installs may have <c>users</c> / <c>logbook</c> without columns this app expects;
+        /// <c>CREATE TABLE IF NOT EXISTS</c> does not add missing columns.
+        /// </summary>
+        private static void ApplyMissingColumnPatches(MySqlConnection conn)
+        {
+            if (TableExists(conn, "users"))
+            {
+                if (!ColumnExists(conn, "users", "fp_template"))
+                    ExecuteNonQuery(conn, "ALTER TABLE users ADD COLUMN fp_template LONGBLOB NULL");
+                if (!ColumnExists(conn, "users", "employee_id"))
+                    ExecuteNonQuery(conn, "ALTER TABLE users ADD COLUMN employee_id VARCHAR(50) NULL");
+                if (!ColumnExists(conn, "users", "address"))
+                    ExecuteNonQuery(conn, "ALTER TABLE users ADD COLUMN address VARCHAR(255) NULL");
+                if (!ColumnExists(conn, "users", "contact_number"))
+                    ExecuteNonQuery(conn, "ALTER TABLE users ADD COLUMN contact_number VARCHAR(50) NULL");
+                if (!ColumnExists(conn, "users", "created_at"))
+                    ExecuteNonQuery(conn,
+                        "ALTER TABLE users ADD COLUMN created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
+                if (!ColumnExists(conn, "users", "full_name"))
+                    ExecuteNonQuery(conn,
+                        "ALTER TABLE users ADD COLUMN full_name VARCHAR(150) NOT NULL DEFAULT ''");
+                if (!ColumnExists(conn, "users", "username"))
+                    ExecuteNonQuery(conn, "ALTER TABLE users ADD COLUMN username VARCHAR(100) NULL");
+                if (!ColumnExists(conn, "users", "password"))
+                    ExecuteNonQuery(conn, "ALTER TABLE users ADD COLUMN password VARCHAR(255) NULL");
+                if (!ColumnExists(conn, "users", "role"))
+                    ExecuteNonQuery(conn, "ALTER TABLE users ADD COLUMN role VARCHAR(30) NOT NULL DEFAULT 'employee'");
+            }
+
+            if (TableExists(conn, "logbook"))
+            {
+                if (!ColumnExists(conn, "logbook", "fp_template"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN fp_template LONGBLOB NULL");
+                if (!ColumnExists(conn, "logbook", "purpose_of_transaction"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN purpose_of_transaction TEXT NULL");
+                if (!ColumnExists(conn, "logbook", "address"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN address VARCHAR(255) NOT NULL DEFAULT ''");
+                if (!ColumnExists(conn, "logbook", "contact_number"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN contact_number VARCHAR(50) NOT NULL DEFAULT ''");
+                if (!ColumnExists(conn, "logbook", "office_or_person_to_visit"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN office_or_person_to_visit VARCHAR(255) NOT NULL DEFAULT ''");
+                if (!ColumnExists(conn, "logbook", "is_authorized_representative"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN is_authorized_representative TINYINT(1) NOT NULL DEFAULT 0");
+                if (!ColumnExists(conn, "logbook", "authorization_letter_verified"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN authorization_letter_verified TINYINT(1) NOT NULL DEFAULT 0");
+                if (!ColumnExists(conn, "logbook", "valid_id_verified"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN valid_id_verified TINYINT(1) NOT NULL DEFAULT 0");
+                if (!ColumnExists(conn, "logbook", "represented_person_name"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN represented_person_name VARCHAR(150) NOT NULL DEFAULT ''");
+                if (!ColumnExists(conn, "logbook", "transaction_type"))
+                    ExecuteNonQuery(conn, "ALTER TABLE logbook ADD COLUMN transaction_type VARCHAR(40) NOT NULL DEFAULT 'visitor'");
+                if (ColumnExists(conn, "logbook", "purpose_of_transaction"))
+                    ExecuteNonQuery(conn,
+                        "UPDATE logbook SET purpose_of_transaction = '' WHERE purpose_of_transaction IS NULL");
+                // Visitor logbook rows without biometric registration do not allocate a fingerprint id.
+                ExecuteNonQuery(conn, "ALTER TABLE logbook MODIFY COLUMN fingerprint_id INT NULL");
+            }
+
+            if (TableExists(conn, "attendance_log"))
+            {
+                if (!ColumnExists(conn, "attendance_log", "entry_type"))
+                    ExecuteNonQuery(conn, "ALTER TABLE attendance_log ADD COLUMN entry_type VARCHAR(10) NOT NULL DEFAULT 'IN'");
+                if (!ColumnExists(conn, "attendance_log", "log_time"))
+                    ExecuteNonQuery(conn,
+                        "ALTER TABLE attendance_log ADD COLUMN log_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
+            }
+
+        }
+
+        /// <summary>Open a connection to the app database after ensuring DB and core tables exist.</summary>
+        private MySqlConnection CreateOpenConnection()
+        {
+            if (!_schemaReady)
+            {
+                lock (_schemaLock)
+                {
+                    if (!_schemaReady)
+                    {
+                        EnsureDatabaseCreated();
+                        using (var setup = new MySqlConnection(AppDbConnection.FullConnectionString))
+                        {
+                            setup.Open();
+                            EnsureCoreTables(setup);
+                            EnsureLogbookTable(setup);
+                            ApplyMissingColumnPatches(setup);
+                            EnsureDefaultAdminAccount(setup);
+                        }
+                        _schemaReady = true;
+                    }
+                }
+            }
+
+            var conn = new MySqlConnection(AppDbConnection.FullConnectionString);
+            conn.Open();
+            return conn;
+        }
+
+        // Test the connection
+        public bool TestConnection()
+        {
+            LastConnectionFailureDetail = null;
+            try
+            {
+                using var conn = CreateOpenConnection();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LastConnectionFailureDetail = FormatConnectionException(ex);
+                return false;
+            }
+        }
+
+        private static string FormatConnectionException(Exception ex)
+        {
+            var msg = ex.Message;
+            if (ex.InnerException != null)
+                msg += Environment.NewLine + ex.InnerException.Message;
+            return msg;
+        }
+
+        public void EnsureLogbookTable()
+        {
+            using var conn = CreateOpenConnection();
+        }
+
+        private void EnsureLogbookTable(MySqlConnection conn)
+        {
+            string sql = @"
+                CREATE TABLE IF NOT EXISTS logbook (
+                    logbook_id INT AUTO_INCREMENT PRIMARY KEY,
+                    full_name VARCHAR(150) NOT NULL,
+                    address VARCHAR(255) NOT NULL,
+                    contact_number VARCHAR(50) NOT NULL,
+                    purpose_of_transaction TEXT NOT NULL,
+                    office_or_person_to_visit VARCHAR(255) NOT NULL DEFAULT '',
+                    is_authorized_representative TINYINT(1) NOT NULL DEFAULT 0,
+                    authorization_letter_verified TINYINT(1) NOT NULL DEFAULT 0,
+                    valid_id_verified TINYINT(1) NOT NULL DEFAULT 0,
+                    represented_person_name VARCHAR(150) NOT NULL DEFAULT '',
+                    transaction_type VARCHAR(40) NOT NULL DEFAULT 'visitor',
+                    fingerprint_id INT NULL,
+                    fp_template LONGBLOB NULL,
+                    time_in DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_logbook_fingerprint_id (fingerprint_id),
+                    INDEX idx_logbook_time_in (time_in)
+                ) ENGINE=InnoDB;";
+
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.ExecuteNonQuery();
+        }
+
+        // Enroll a new user with their fingerprint template
+        public int EnrollUser(string fullName, string employeeId, byte[] template, string address, string contactNumber)
+        {
+            if (IsPersonAlreadyRegistered(fullName, address))
+                throw new InvalidOperationException(PersonAlreadyRegisteredMessage);
+
+            using var conn = CreateOpenConnection();
+            bool hasEmail = ColumnExists(conn, "users", "email");
+            bool hasName = ColumnExists(conn, "users", "name");
+            bool hasPassword = ColumnExists(conn, "users", "password");
+            bool hasUsername = ColumnExists(conn, "users", "username");
+            bool hasAddress = ColumnExists(conn, "users", "address");
+            bool hasContactNumber = ColumnExists(conn, "users", "contact_number");
+
+            var generatedEmail = hasEmail ? BuildGeneratedEmployeeEmail(employeeId, fullName) : null;
+            var columns = new List<string> { "full_name", "employee_id", "fp_template", "role" };
+            var values = new List<string> { "@name", "@eid", "@tpl", "'employee'" };
+
+            if (hasName)
+            {
+                columns.Add("name");
+                values.Add("@name");
+            }
+
+            if (hasEmail)
+            {
+                columns.Add("email");
+                values.Add("@email");
+            }
+
+            if (hasUsername)
+            {
+                columns.Add("username");
+                values.Add("@username");
+            }
+
+            if (hasPassword)
+            {
+                columns.Add("password");
+                values.Add("@password");
+            }
+            if (hasAddress)
+            {
+                columns.Add("address");
+                values.Add("@address");
+            }
+            if (hasContactNumber)
+            {
+                columns.Add("contact_number");
+                values.Add("@contact");
+            }
+
+            string sql = $@"INSERT INTO users ({string.Join(", ", columns)})
+                            VALUES ({string.Join(", ", values)});
+                            SELECT LAST_INSERT_ID();";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@name", fullName);
+            cmd.Parameters.AddWithValue("@eid", employeeId);
+            cmd.Parameters.AddWithValue("@tpl", template);
+            if (hasEmail)
+                cmd.Parameters.AddWithValue("@email", generatedEmail);
+            if (hasUsername)
+                cmd.Parameters.AddWithValue("@username", generatedEmail ?? employeeId ?? fullName);
+            if (hasPassword)
+                cmd.Parameters.AddWithValue("@password", string.Empty);
+            if (hasAddress)
+                cmd.Parameters.AddWithValue("@address", address ?? string.Empty);
+            if (hasContactNumber)
+                cmd.Parameters.AddWithValue("@contact", contactNumber ?? string.Empty);
+            return Convert.ToInt32(cmd.ExecuteScalar());
+        }
+
+        private static string BuildGeneratedEmployeeEmail(string employeeId, string fullName)
+        {
+            string baseValue = !string.IsNullOrWhiteSpace(employeeId) ? employeeId.Trim() : fullName?.Trim() ?? "employee";
+            var sanitizedChars = new List<char>(baseValue.Length);
+            foreach (char ch in baseValue.ToLowerInvariant())
+            {
+                if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))
+                    sanitizedChars.Add(ch);
+            }
+
+            string sanitized = sanitizedChars.Count > 0 ? new string(sanitizedChars.ToArray()) : "employee";
+            return $"{sanitized}.{Guid.NewGuid():N}@fingerprint.local";
+        }
+
+        // Load all users with their fingerprint templates (for matching)
+        public List<UserModel> GetAllUsersWithTemplates()
+        {
+            var users = new List<UserModel>();
+            using var conn = CreateOpenConnection();
+            string sql = @"SELECT
+                               id,
+                               COALESCE(NULLIF(name, ''), NULLIF(full_name, ''), '(Unnamed)') AS full_name,
+                               employee_id,
+                               fp_template
+                           FROM users";
+            using var cmd = new MySqlCommand(sql, conn);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                users.Add(new UserModel
+                {
+                    Id = reader.GetInt32("id"),
+                    FullName = reader.GetString("full_name"),
+                    EmployeeId = reader.IsDBNull(reader.GetOrdinal("employee_id"))
+                                 ? "" : reader.GetString("employee_id"),
+                    FpTemplate = reader["fp_template"] as byte[]
+                });
+            }
+            return users;
+        }
+
+        /// <summary>
+        /// Real-time check: an employee (users.id) that still has a non-null template in MySQL.
+        /// If the user was deleted or the template was cleared, returns null so the app does not trust cached lists or stale ZK matches.
+        /// </summary>
+        public UserModel TryGetUserWithValidTemplateById(int userId)
+        {
+            if (userId < 1) return null;
+            using var conn = CreateOpenConnection();
+            const string sql = @"SELECT
+                                     id,
+                                     COALESCE(NULLIF(name, ''), NULLIF(full_name, ''), '(Unnamed)') AS full_name,
+                                     employee_id,
+                                     fp_template
+                                 FROM users
+                                 WHERE id = @id AND fp_template IS NOT NULL";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@id", userId);
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read()) return null;
+            return new UserModel
+            {
+                Id = reader.GetInt32("id"),
+                FullName = reader.GetString("full_name"),
+                EmployeeId = reader.IsDBNull(reader.GetOrdinal("employee_id"))
+                    ? "" : reader.GetString("employee_id"),
+                FpTemplate = reader["fp_template"] as byte[]
+            };
+        }
+
+        public string GetUserDisplayNameById(int userId)
+        {
+            if (userId < 1) return null;
+            using var conn = CreateOpenConnection();
+            const string sql = @"SELECT COALESCE(NULLIF(name, ''), NULLIF(full_name, ''), '(Unnamed)') AS display_name
+                                 FROM users
+                                 WHERE id = @id
+                                 LIMIT 1";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@id", userId);
+            var result = cmd.ExecuteScalar();
+            return result == null || result is DBNull ? null : Convert.ToString(result);
+        }
+
+        // Log attendance (IN or OUT)
+        public void LogAttendance(int userId, string entryType)
+        {
+            using var conn = CreateOpenConnection();
+            string sql = @"INSERT INTO attendance_log (user_id, entry_type)
+                           VALUES (@uid, @type)";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@uid", userId);
+            cmd.Parameters.AddWithValue("@type", entryType);
+            cmd.ExecuteNonQuery();
+        }
+
+        /// <summary>
+        /// Auto-attendance policy:
+        /// - no previous log or previous OUT => next scan logs IN
+        /// - previous IN => next scan logs OUT, but only after the minimum gap
+        /// </summary>
+        public bool TryDetermineNextAttendanceEntry(int userId, TimeSpan minimumGapBeforeOut, out string nextEntryType, out DateTime? nextAllowedOutAt)
+        {
+            nextEntryType = "IN";
+            nextAllowedOutAt = null;
+
+            using var conn = CreateOpenConnection();
+            const string sql = @"
+                SELECT entry_type, log_time
+                FROM attendance_log
+                WHERE user_id = @uid
+                ORDER BY log_time DESC, id DESC
+                LIMIT 1";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@uid", userId);
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read())
+                return true; // first scan -> IN
+
+            string lastEntryType = (reader.GetString("entry_type") ?? string.Empty).Trim().ToUpperInvariant();
+            DateTime lastLogTime = reader.GetDateTime("log_time");
+
+            if (lastEntryType == "IN")
+            {
+                nextEntryType = "OUT";
+                nextAllowedOutAt = lastLogTime.Add(minimumGapBeforeOut);
+                return DateTime.Now >= nextAllowedOutAt.Value;
+            }
+
+            nextEntryType = "IN";
+            return true;
+        }
+
+        // Get attendance records (for the log viewer)
+        public List<AttendanceModel> GetAttendanceLogs(DateTime date)
+        {
+            var logs = new List<AttendanceModel>();
+            using var conn = CreateOpenConnection();
+            string sql = @"SELECT
+                               a.id,
+                               a.user_id,
+                               COALESCE(NULLIF(u.name, ''), NULLIF(u.full_name, ''), '(Unnamed)') AS full_name,
+                               a.log_time,
+                               a.entry_type
+                           FROM attendance_log a
+                           JOIN users u ON a.user_id = u.id
+                           WHERE DATE(a.log_time) = @date
+                           ORDER BY a.log_time DESC";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@date", date.ToString("yyyy-MM-dd"));
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                logs.Add(new AttendanceModel
+                {
+                    Id = reader.GetInt32("id"),
+                    UserId = reader.GetInt32("user_id"),
+                    FullName = reader.GetString("full_name"),
+                    LogTime = reader.GetDateTime("log_time"),
+                    EntryType = reader.GetString("entry_type")
+                });
+            }
+            return logs;
+        }
+
+        // Get all users (for list view)
+        public List<UserModel> GetAllUsers()
+        {
+            var users = new List<UserModel>();
+            using var conn = CreateOpenConnection();
+            string sql = @"SELECT
+                               id,
+                               COALESCE(NULLIF(name, ''), NULLIF(full_name, ''), '(Unnamed)') AS full_name,
+                               employee_id,
+                               created_at
+                           FROM users
+                           ORDER BY full_name";
+            using var cmd = new MySqlCommand(sql, conn);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                users.Add(new UserModel
+                {
+                    Id = reader.GetInt32("id"),
+                    FullName = reader.GetString("full_name"),
+                    EmployeeId = reader.IsDBNull(reader.GetOrdinal("employee_id"))
+                                 ? "" : reader.GetString("employee_id"),
+                    CreatedAt = reader.GetDateTime("created_at")
+                });
+            }
+            return users;
+        }
+
+        public int GetNextVisitorFingerprintId()
+        {
+            using var conn = CreateOpenConnection();
+
+            int startAt = VisitorFingerprintIdRangeStart;
+            string sql = "SELECT IFNULL(MAX(fingerprint_id), @startAt - 1) + 1 FROM logbook WHERE fingerprint_id >= @startAt";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@startAt", startAt);
+            return Convert.ToInt32(cmd.ExecuteScalar());
+        }
+
+        public VisitorProfile GetVisitorProfile(int fingerprintId)
+        {
+            using var conn = CreateOpenConnection();
+
+            string sql = @"
+                SELECT l.fingerprint_id, l.full_name, l.address, l.contact_number, l.office_or_person_to_visit,
+                       EXISTS(
+                           SELECT 1 FROM logbook x
+                           WHERE x.fingerprint_id = l.fingerprint_id AND x.fp_template IS NOT NULL
+                           LIMIT 1
+                       ) AS has_fp
+                FROM logbook l
+                WHERE l.fingerprint_id = @fid
+                ORDER BY l.logbook_id DESC
+                LIMIT 1";
+
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@fid", fingerprintId);
+            using var reader = cmd.ExecuteReader();
+            if (!reader.Read()) return null;
+
+            return new VisitorProfile
+            {
+                FingerprintId = reader.GetInt32("fingerprint_id"),
+                FullName = reader.GetString("full_name"),
+                Address = reader.GetString("address"),
+                ContactNumber = reader.GetString("contact_number"),
+                OfficeOrPersonToVisit = reader.GetString("office_or_person_to_visit"),
+                HasFingerprintOnFile = Convert.ToInt32(reader["has_fp"]) == 1
+            };
+        }
+
+        /// <summary>
+        /// Latest visitor-type log row per identity, filtered by name/contact/address.
+        /// Empty <paramref name="searchTerm"/> returns all saved visitor profiles (enrolled and manual).
+        /// Identities with a fingerprint id are grouped by that id; manual entries (null fingerprint id)
+        /// are grouped by name and contact so they still appear in Find Saved Visitor.
+        /// </summary>
+        public List<VisitorIdentityPickRow> SearchVisitorIdentitiesForReturnVisit(string searchTerm, int limit = 500)
+        {
+            var list = new List<VisitorIdentityPickRow>();
+            string term = searchTerm?.Trim() ?? string.Empty;
+            bool hasTerm = term.Length > 0;
+            string like = hasTerm
+                ? "%" + term.Replace("%", "\\%").Replace("_", "\\_") + "%"
+                : null;
+
+            using var conn = CreateOpenConnection();
+
+            string sql = @"
+                SELECT l.fingerprint_id, l.full_name, l.address, l.contact_number, l.time_in,
+                       CASE WHEN l.fingerprint_id IS NULL THEN 0 ELSE EXISTS(
+                          SELECT 1 FROM logbook x
+                          WHERE x.fingerprint_id = l.fingerprint_id AND x.fp_template IS NOT NULL
+                          LIMIT 1
+                       ) END AS has_fp
+                FROM logbook l
+                INNER JOIN (
+                    SELECT MAX(logbook_id) AS mid
+                    FROM logbook
+                    WHERE COALESCE(NULLIF(transaction_type, ''), 'visitor') = @visitorType
+                    GROUP BY COALESCE(
+                        CONCAT('f:', fingerprint_id),
+                        CONCAT('n:', LOWER(TRIM(full_name)), '|',
+                            REPLACE(REPLACE(REPLACE(REPLACE(TRIM(IFNULL(contact_number, '')), ' ', ''), '-', ''), '(', ''), '+', ''))
+                    )
+                ) z ON l.logbook_id = z.mid";
+
+            if (hasTerm)
+            {
+                sql += @"
+                WHERE l.full_name LIKE @like
+                   OR IFNULL(l.contact_number, '') LIKE @like
+                   OR IFNULL(l.address, '') LIKE @like";
+            }
+
+            sql += @"
+                ORDER BY l.full_name
+                LIMIT @lim";
+
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@visitorType", LogbookTransactionTypeVisitor);
+            if (hasTerm)
+                cmd.Parameters.AddWithValue("@like", like);
+            cmd.Parameters.AddWithValue("@lim", limit);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                list.Add(new VisitorIdentityPickRow
+                {
+                    FingerprintId = reader.IsDBNull(reader.GetOrdinal("fingerprint_id")) ? 0 : reader.GetInt32("fingerprint_id"),
+                    FullName = reader.IsDBNull(reader.GetOrdinal("full_name")) ? string.Empty : reader.GetString("full_name"),
+                    Address = reader.IsDBNull(reader.GetOrdinal("address")) ? string.Empty : reader.GetString("address"),
+                    ContactNumber = reader.IsDBNull(reader.GetOrdinal("contact_number")) ? string.Empty : reader.GetString("contact_number"),
+                    LastVisit = reader.IsDBNull(reader.GetOrdinal("time_in")) ? DateTime.MinValue : reader.GetDateTime("time_in"),
+                    HasFingerprintOnFile = Convert.ToInt32(reader["has_fp"]) == 1
+                });
+            }
+
+            return list;
+        }
+
+        /// <summary>
+        /// True when an employee or logbook person already exists with the same full name and complete address.
+        /// Used only when creating a new person; search, view, return visits, and updates are not blocked.
+        /// </summary>
+        public bool IsPersonAlreadyRegistered(string fullName, string completeAddress)
+        {
+            string name = NormalizePersonCompareValue(fullName);
+            string address = NormalizePersonCompareValue(completeAddress);
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(address))
+                return false;
+
+            using var conn = CreateOpenConnection();
+
+            if (TableExists(conn, "users"))
+            {
+                bool hasFullName = ColumnExists(conn, "users", "full_name");
+                bool hasName = ColumnExists(conn, "users", "name");
+                bool hasAddress = ColumnExists(conn, "users", "address");
+                if (hasAddress && (hasFullName || hasName))
+                {
+                    string nameExpr = hasFullName && hasName
+                        ? "COALESCE(NULLIF(full_name, ''), NULLIF(name, ''), '')"
+                        : hasFullName ? "IFNULL(full_name, '')" : "IFNULL(name, '')";
+                    string sql = $"SELECT {nameExpr} AS full_name, IFNULL(address, '') AS address FROM users";
+                    using var cmd = new MySqlCommand(sql, conn);
+                    using var reader = cmd.ExecuteReader();
+                    if (ReaderContainsPerson(reader, name, address))
+                        return true;
+                }
+            }
+
+            if (TableExists(conn, "logbook") && ColumnExists(conn, "logbook", "full_name") && ColumnExists(conn, "logbook", "address"))
+            {
+                const string sql = "SELECT IFNULL(full_name, '') AS full_name, IFNULL(address, '') AS address FROM logbook";
+                using var cmd = new MySqlCommand(sql, conn);
+                using var reader = cmd.ExecuteReader();
+                if (ReaderContainsPerson(reader, name, address))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool ReaderContainsPerson(MySqlDataReader reader, string normalizedName, string normalizedAddress)
+        {
+            while (reader.Read())
+            {
+                string rowName = NormalizePersonCompareValue(reader.IsDBNull(0) ? string.Empty : reader.GetString(0));
+                string rowAddress = NormalizePersonCompareValue(reader.IsDBNull(1) ? string.Empty : reader.GetString(1));
+                if (rowName == normalizedName && rowAddress == normalizedAddress)
+                    return true;
+            }
+
+            return false;
+        }
+
+        public static string NormalizePersonCompareValue(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return string.Empty;
+
+            string flattened = value.Replace(',', ' ');
+            string[] parts = flattened.Trim().Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+            return string.Join(" ", parts).ToLowerInvariant();
+        }
+
+        /// <summary>
+        /// If a standard visitor identity already exists with the same normalized name and contact, reuse its fingerprint id to avoid duplicate profiles.
+        /// </summary>
+        public bool TryFindExistingVisitorIdentity(string fullName, string contactNumber, out int fingerprintId)
+        {
+            fingerprintId = 0;
+            string n = (fullName ?? "").Trim().ToLowerInvariant();
+            string c = NormalizeVisitorContactCompare(contactNumber);
+            if (string.IsNullOrEmpty(n) || string.IsNullOrEmpty(c))
+                return false;
+
+            using var conn = CreateOpenConnection();
+            string sql = @"
+                SELECT l.fingerprint_id
+                FROM logbook l
+                INNER JOIN (
+                    SELECT fingerprint_id, MAX(logbook_id) AS mid
+                    FROM logbook
+                    WHERE COALESCE(NULLIF(transaction_type, ''), 'visitor') = @visitorType
+                      AND fingerprint_id IS NOT NULL
+                    GROUP BY fingerprint_id
+                ) z ON l.logbook_id = z.mid
+                WHERE LOWER(TRIM(l.full_name)) = @name
+                  AND REPLACE(REPLACE(REPLACE(REPLACE(TRIM(l.contact_number), ' ', ''), '-', ''), '(', ''), '+', '') = @contact
+                LIMIT 1";
+
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@visitorType", LogbookTransactionTypeVisitor);
+            cmd.Parameters.AddWithValue("@name", n.Length > 150 ? n.Substring(0, 150) : n);
+            cmd.Parameters.AddWithValue("@contact", c.Length > 80 ? c.Substring(0, 80) : c);
+            var o = cmd.ExecuteScalar();
+            if (o == null || o is DBNull)
+                return false;
+            fingerprintId = Convert.ToInt32(o);
+            return fingerprintId > 0;
+        }
+
+        /// <summary>
+        /// True if any visitor-type logbook row for this fingerprint id has a stored template (same rule as visitor profile search).
+        /// </summary>
+        public bool VisitorIdentityHasFingerprintTemplate(int fingerprintId)
+        {
+            if (fingerprintId <= 0)
+                return false;
+
+            using var conn = CreateOpenConnection();
+            const string sql = @"
+                SELECT EXISTS(
+                    SELECT 1 FROM logbook x
+                    WHERE x.fingerprint_id = @fid
+                      AND x.fp_template IS NOT NULL
+                      AND COALESCE(NULLIF(x.transaction_type, ''), @visitorType) = @visitorType
+                    LIMIT 1
+                )";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@fid", fingerprintId);
+            cmd.Parameters.AddWithValue("@visitorType", LogbookTransactionTypeVisitor);
+            return Convert.ToInt32(cmd.ExecuteScalar()) == 1;
+        }
+
+        private static string NormalizeVisitorContactCompare(string contactNumber)
+        {
+            if (string.IsNullOrWhiteSpace(contactNumber)) return string.Empty;
+            string s = contactNumber.Trim()
+                .Replace(" ", "")
+                .Replace("-", "")
+                .Replace("(", "")
+                .Replace(")", "")
+                .Replace("+", "");
+            if (s.StartsWith("09") && s.Length == 11)
+                return "63" + s.Substring(1);
+            if (s.StartsWith("630") && s.Length == 13)
+                return "63" + s.Substring(3);
+            return s;
+        }
+
+        public void InsertNewVisitorLog(
+            int? fingerprintId,
+            string fullName,
+            string address,
+            string contactNumber,
+            string purposeOfTransaction,
+            string officeOrPersonToVisit,
+            bool isAuthorizedRepresentative,
+            bool authorizationLetterVerified,
+            bool validIdVerified,
+            string representedPersonName,
+            byte[] fingerprintTemplate,
+            string transactionType = null)
+        {
+            using var conn = CreateOpenConnection();
+
+            string tt = string.IsNullOrWhiteSpace(transactionType) ? LogbookTransactionTypeVisitor : transactionType.Trim();
+
+            string sql = @"
+                INSERT INTO logbook
+                (full_name, address, contact_number, purpose_of_transaction, office_or_person_to_visit,
+                 is_authorized_representative, authorization_letter_verified, valid_id_verified, represented_person_name,
+                 transaction_type, fingerprint_id, fp_template)
+                VALUES (@name, @address, @contact, @purpose, @officeToVisit,
+                        @isAuthorizedRep, @letterVerified, @validIdVerified, @representedPersonName,
+                        @transactionType, @fid, @tpl)";
+
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@name", fullName);
+            cmd.Parameters.AddWithValue("@address", address);
+            cmd.Parameters.AddWithValue("@contact", contactNumber);
+            cmd.Parameters.AddWithValue("@purpose", purposeOfTransaction);
+            cmd.Parameters.AddWithValue("@officeToVisit", officeOrPersonToVisit ?? string.Empty);
+            cmd.Parameters.AddWithValue("@isAuthorizedRep", isAuthorizedRepresentative ? 1 : 0);
+            cmd.Parameters.AddWithValue("@letterVerified", authorizationLetterVerified ? 1 : 0);
+            cmd.Parameters.AddWithValue("@validIdVerified", validIdVerified ? 1 : 0);
+            cmd.Parameters.AddWithValue("@representedPersonName", representedPersonName ?? string.Empty);
+            cmd.Parameters.AddWithValue("@transactionType", tt);
+            cmd.Parameters.AddWithValue("@fid", fingerprintId.HasValue ? (object)fingerprintId.Value : DBNull.Value);
+            cmd.Parameters.AddWithValue("@tpl", (object)fingerprintTemplate ?? DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+
+        public bool InsertExistingVisitorLog(int fingerprintId, string purposeOfTransaction, string officeOrPersonToVisit,
+            byte[] fingerprintTemplate = null)
+        {
+            using var conn = CreateOpenConnection();
+
+            string selectSql = @"
+                SELECT full_name, address, contact_number
+                FROM logbook
+                WHERE fingerprint_id = @fid
+                ORDER BY logbook_id DESC
+                LIMIT 1";
+            using var selectCmd = new MySqlCommand(selectSql, conn);
+            selectCmd.Parameters.AddWithValue("@fid", fingerprintId);
+
+            string fullName = null;
+            string address = null;
+            string contact = null;
+
+            using (var reader = selectCmd.ExecuteReader())
+            {
+                if (!reader.Read()) return false;
+                fullName = reader.GetString("full_name");
+                address = reader.GetString("address");
+                contact = reader.GetString("contact_number");
+            }
+
+            string insertSql = @"
+                INSERT INTO logbook
+                (full_name, address, contact_number, purpose_of_transaction, office_or_person_to_visit,
+                 is_authorized_representative, authorization_letter_verified, valid_id_verified, represented_person_name,
+                 transaction_type, fingerprint_id, fp_template)
+                VALUES (@name, @address, @contact, @purpose, @officeToVisit,
+                        0, 0, 0, '', @transactionType, @fid, @tpl)";
+            using var insertCmd = new MySqlCommand(insertSql, conn);
+            insertCmd.Parameters.AddWithValue("@name", fullName);
+            insertCmd.Parameters.AddWithValue("@address", address);
+            insertCmd.Parameters.AddWithValue("@contact", contact);
+            insertCmd.Parameters.AddWithValue("@purpose", purposeOfTransaction);
+            insertCmd.Parameters.AddWithValue("@officeToVisit", officeOrPersonToVisit ?? string.Empty);
+            insertCmd.Parameters.AddWithValue("@transactionType", LogbookTransactionTypeVisitor);
+            insertCmd.Parameters.AddWithValue("@fid", fingerprintId);
+            insertCmd.Parameters.AddWithValue("@tpl", (object)fingerprintTemplate ?? DBNull.Value);
+            insertCmd.ExecuteNonQuery();
+            return true;
+        }
+
+        /// <summary>
+        /// Visitor logbook rows for the privileged grid. When <paramref name="searchFilter"/> is empty,
+        /// only rows on <paramref name="date"/> (local calendar day of <c>time_in</c>) are returned.
+        /// When <paramref name="searchFilter"/> is non-empty, all dates are searched (filter date is ignored).
+        /// </summary>
+        public List<VisitorLogEntry> GetVisitorLogEntries(DateTime date, string searchFilter = null)
+        {
+            var logs = new List<VisitorLogEntry>();
+            using var conn = CreateOpenConnection();
+
+            string filter = searchFilter?.Trim();
+            string like = string.IsNullOrEmpty(filter)
+                ? null
+                : "%" + filter.Replace("%", "\\%").Replace("_", "\\_") + "%";
+
+            bool hasSearch = !string.IsNullOrEmpty(like);
+
+            string sql = @"
+                SELECT l.logbook_id, l.full_name, l.address, l.contact_number, l.purpose_of_transaction, l.office_or_person_to_visit,
+                       COALESCE(NULLIF(l.transaction_type, ''), 'visitor') AS transaction_type,
+                       l.is_authorized_representative, l.authorization_letter_verified, l.valid_id_verified, l.represented_person_name,
+                       l.fingerprint_id, l.time_in,
+                       CASE WHEN l.fingerprint_id IS NULL THEN 0 ELSE EXISTS(
+                           SELECT 1 FROM logbook x
+                           WHERE x.fingerprint_id = l.fingerprint_id AND x.fp_template IS NOT NULL
+                           LIMIT 1
+                       ) END AS has_fp
+                FROM logbook l
+                WHERE ";
+
+            if (hasSearch)
+            {
+                sql += @"(
+                    l.full_name LIKE @like OR l.contact_number LIKE @like OR l.address LIKE @like
+                    OR l.purpose_of_transaction LIKE @like OR l.represented_person_name LIKE @like
+                    OR l.office_or_person_to_visit LIKE @like)";
+            }
+            else
+                sql += "DATE(l.time_in) = @date";
+
+            sql += " ORDER BY l.time_in DESC";
+
+            using var cmd = new MySqlCommand(sql, conn);
+            if (!hasSearch)
+                cmd.Parameters.AddWithValue("@date", date.ToString("yyyy-MM-dd"));
+            else
+                cmd.Parameters.AddWithValue("@like", like);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                logs.Add(new VisitorLogEntry
+                {
+                    LogbookId = reader.GetInt32("logbook_id"),
+                    FullName = reader.GetString("full_name"),
+                    Address = reader.GetString("address"),
+                    ContactNumber = reader.GetString("contact_number"),
+                    PurposeOfTransaction = reader.GetString("purpose_of_transaction"),
+                    OfficeOrPersonToVisit = reader.GetString("office_or_person_to_visit"),
+                    TransactionType = reader.GetString("transaction_type"),
+                    IsAuthorizedRepresentative = Convert.ToInt32(reader["is_authorized_representative"]) == 1,
+                    AuthorizationLetterVerified = Convert.ToInt32(reader["authorization_letter_verified"]) == 1,
+                    ValidIdVerified = Convert.ToInt32(reader["valid_id_verified"]) == 1,
+                    RepresentedPersonName = reader.GetString("represented_person_name"),
+                    FingerprintId = reader.IsDBNull(reader.GetOrdinal("fingerprint_id")) ? (int?)null : reader.GetInt32("fingerprint_id"),
+                    TimeIn = reader.GetDateTime("time_in"),
+                    HasFingerprintOnFile = Convert.ToInt32(reader["has_fp"]) == 1
+                });
+            }
+            return logs;
+        }
+
+        /// <summary>
+        /// Clears stored fingerprint templates for a visitor <paramref name="fingerprintId"/>
+        /// so the same person can be enrolled again. Logbook rows (name, time, purpose) are kept;
+        /// only the binary template data is removed.
+        /// </summary>
+        public int ClearVisitorFingerprintTemplate(int fingerprintId)
+        {
+            using var conn = CreateOpenConnection();
+            const string sql = "UPDATE logbook SET fp_template = NULL WHERE fingerprint_id = @fid";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@fid", fingerprintId);
+            return cmd.ExecuteNonQuery();
+        }
+
+        /// <summary>Deletes a single logbook row. Returns false if no row was removed.</summary>
+        public bool TryDeleteVisitorLogbookEntry(int logbookId)
+        {
+            using var conn = CreateOpenConnection();
+            using var cmd = new MySqlCommand("DELETE FROM logbook WHERE logbook_id = @id LIMIT 1", conn);
+            cmd.Parameters.AddWithValue("@id", logbookId);
+            return cmd.ExecuteNonQuery() > 0;
+        }
+
+        public bool ValidateAdminCredentials(string username, string password)
+        {
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+                return false;
+
+            using var conn = CreateOpenConnection();
+            bool hasEmail = ColumnExists(conn, "users", "email");
+            bool hasUsername = ColumnExists(conn, "users", "username");
+            string login = username.Trim();
+
+            string identityPredicate = hasEmail && hasUsername
+                ? "(email = @login OR username = @login)"
+                : hasEmail
+                    ? "email = @login"
+                    : "username = @login";
+
+            string sql = $@"
+                SELECT password
+                FROM users
+                WHERE {identityPredicate}
+                  AND role = 'admin'
+                LIMIT 1";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@login", login);
+            var storedObj = cmd.ExecuteScalar();
+            if (storedObj == null || storedObj is DBNull)
+                return false;
+
+            string stored = Convert.ToString(storedObj) ?? string.Empty;
+            if (stored == password)
+                return true;
+
+            // Support Laravel / bcrypt hashes like $2y$...
+            if (stored.StartsWith("$2y$", StringComparison.Ordinal) ||
+                stored.StartsWith("$2a$", StringComparison.Ordinal) ||
+                stored.StartsWith("$2b$", StringComparison.Ordinal))
+            {
+                try
+                {
+                    return OpenBsdBCrypt.CheckPassword(stored, password.ToCharArray());
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            return false;
+        }
+
+        public bool HasAnyActiveAdmin()
+        {
+            using var conn = CreateOpenConnection();
+            bool hasEmail = ColumnExists(conn, "users", "email");
+            bool hasUsername = ColumnExists(conn, "users", "username");
+            string loginPresence = hasEmail && hasUsername
+                ? "((email IS NOT NULL AND email <> '') OR (username IS NOT NULL AND username <> ''))"
+                : hasEmail
+                    ? "(email IS NOT NULL AND email <> '')"
+                    : "(username IS NOT NULL AND username <> '')";
+            string sql = $@"
+                SELECT COUNT(1)
+                FROM users
+                WHERE role = 'admin'
+                  AND {loginPresence}";
+            using var cmd = new MySqlCommand(sql, conn);
+            return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
+        }
+
+        public bool ValidateCredentialsForRoles(string username, string password, params string[] roles)
+        {
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+                return false;
+
+            var normalizedRoles = NormalizeRoles(roles);
+            if (normalizedRoles.Count == 0)
+                return false;
+
+            using var conn = CreateOpenConnection();
+            bool hasEmail = ColumnExists(conn, "users", "email");
+            bool hasUsername = ColumnExists(conn, "users", "username");
+            string login = username.Trim();
+            string identityPredicate = BuildIdentityPredicate(hasEmail, hasUsername);
+
+            var roleParams = new List<string>(normalizedRoles.Count);
+            for (int i = 0; i < normalizedRoles.Count; i++)
+                roleParams.Add($"@role{i}");
+
+            string sql = $@"
+                SELECT password
+                FROM users
+                WHERE {identityPredicate}
+                  AND role IN ({string.Join(", ", roleParams)})
+                LIMIT 1";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@login", login);
+            for (int i = 0; i < normalizedRoles.Count; i++)
+                cmd.Parameters.AddWithValue(roleParams[i], normalizedRoles[i]);
+
+            var storedObj = cmd.ExecuteScalar();
+            if (storedObj == null || storedObj is DBNull)
+                return false;
+
+            string stored = Convert.ToString(storedObj) ?? string.Empty;
+            if (stored == password)
+                return true;
+
+            if (stored.StartsWith("$2y$", StringComparison.Ordinal) ||
+                stored.StartsWith("$2a$", StringComparison.Ordinal) ||
+                stored.StartsWith("$2b$", StringComparison.Ordinal))
+            {
+                try
+                {
+                    return OpenBsdBCrypt.CheckPassword(stored, password.ToCharArray());
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            return false;
+        }
+
+        public bool UserIdHasAnyRole(int userId, params string[] roles)
+        {
+            if (userId <= 0)
+                return false;
+
+            var normalizedRoles = NormalizeRoles(roles);
+            if (normalizedRoles.Count == 0)
+                return false;
+
+            using var conn = CreateOpenConnection();
+            var roleParams = new List<string>(normalizedRoles.Count);
+            for (int i = 0; i < normalizedRoles.Count; i++)
+                roleParams.Add($"@role{i}");
+
+            string sql = $@"
+                SELECT COUNT(1)
+                FROM users
+                WHERE id = @id
+                  AND role IN ({string.Join(", ", roleParams)})
+                LIMIT 1";
+            using var cmd = new MySqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@id", userId);
+            for (int i = 0; i < normalizedRoles.Count; i++)
+                cmd.Parameters.AddWithValue(roleParams[i], normalizedRoles[i]);
+
+            return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
+        }
+
+        public bool HasAnyActiveUserForRoles(params string[] roles)
+        {
+            var normalizedRoles = NormalizeRoles(roles);
+            if (normalizedRoles.Count == 0)
+                return false;
+
+            using var conn = CreateOpenConnection();
+            bool hasEmail = ColumnExists(conn, "users", "email");
+            bool hasUsername = ColumnExists(conn, "users", "username");
+            string loginPresence = hasEmail && hasUsername
+                ? "((email IS NOT NULL AND email <> '') OR (username IS NOT NULL AND username <> ''))"
+                : hasEmail
+                    ? "(email IS NOT NULL AND email <> '')"
+                    : "(username IS NOT NULL AND username <> '')";
+
+            var roleParams = new List<string>(normalizedRoles.Count);
+            for (int i = 0; i < normalizedRoles.Count; i++)
+                roleParams.Add($"@role{i}");
+
+            string sql = $@"
+                SELECT COUNT(1)
+                FROM users
+                WHERE role IN ({string.Join(", ", roleParams)})
+                  AND {loginPresence}";
+            using var cmd = new MySqlCommand(sql, conn);
+            for (int i = 0; i < normalizedRoles.Count; i++)
+                cmd.Parameters.AddWithValue(roleParams[i], normalizedRoles[i]);
+            return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
+        }
+
+        private static string BuildIdentityPredicate(bool hasEmail, bool hasUsername)
+        {
+            return hasEmail && hasUsername
+                ? "(email = @login OR username = @login)"
+                : hasEmail
+                    ? "email = @login"
+                    : "username = @login";
+        }
+
+        private static List<string> NormalizeRoles(string[] roles)
+        {
+            var normalized = new List<string>();
+            if (roles == null) return normalized;
+
+            foreach (var role in roles)
+            {
+                if (string.IsNullOrWhiteSpace(role)) continue;
+                string value = role.Trim().ToLowerInvariant();
+                if (value == "admin" || value == "employee" || value == "logbook")
+                    normalized.Add(value);
+            }
+            return normalized;
+        }
+    }
+
+    /// <summary>MySQL settings shared by <see cref="DatabaseHelper"/> and <see cref="FingerprintEngine"/>.</summary>
+    internal static class AppDbConnection
+    {
+        /// <summary>Use IPv4 loopback so Windows does not prefer ::1 when MySQL only listens on 127.0.0.1.</summary>
+        public const string Host = "127.0.0.1";
+        public const uint Port = 3306;
+        public const string UserId = "root";
+        public const string Password = "root";
+        public const string DatabaseName = "attendance_db";
+
+        public static string ServerConnectionString { get; } = Build(false);
+        public static string FullConnectionString { get; } = Build(true);
+
+        private static string Build(bool includeDatabase)
+        {
+            var b = new MySqlConnectionStringBuilder
+            {
+                Server = Host,
+                Port = Port,
+                UserID = UserId,
+                Password = Password,
+                SslMode = MySqlSslMode.Preferred,
+                AllowPublicKeyRetrieval = true,
+                ConnectionTimeout = 8,
+            };
+            if (includeDatabase)
+                b.Database = DatabaseName;
+            return b.ConnectionString;
+        }
+    }
+}
